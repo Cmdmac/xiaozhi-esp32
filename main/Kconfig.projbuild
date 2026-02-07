@@ -613,7 +613,7 @@ choice DISPLAY_STYLE
         bool "Emote animation style"
         depends on BOARD_TYPE_ESP_BOX || BOARD_TYPE_ESP_BOX_3 \
             || BOARD_TYPE_ECHOEAR || BOARD_TYPE_LICHUANG_DEV_S3 \
-            || BOARD_TYPE_ESP_SENSAIRSHUTTLE
+            || BOARD_TYPE_ESP_SENSAIRSHUTTLE || BOARD_TYPE_BREAD_COMPACT_WIFI_LCD
 endchoice
 
 choice WAKE_WORD_TYPE
