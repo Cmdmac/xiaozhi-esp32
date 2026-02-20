@@ -8,7 +8,7 @@ public:
     SystemReset(gpio_num_t reset_nvs_pin, gpio_num_t reset_factory_pin); // 构造函数私有化
     void CheckButtons();
 
-private:
+public:
     gpio_num_t reset_nvs_pin_;
     gpio_num_t reset_factory_pin_;
 
