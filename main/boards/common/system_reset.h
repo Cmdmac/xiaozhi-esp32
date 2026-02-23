@@ -12,6 +12,7 @@ public:
     gpio_num_t reset_nvs_pin_;
     gpio_num_t reset_factory_pin_;
 
+    void ResetWifi();
     void ResetNvsFlash();
     void ResetToFactory();
     void RestartInSeconds(int seconds);

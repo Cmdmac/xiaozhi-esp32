@@ -182,17 +182,25 @@ private:
 
     // 物联网初始化，添加对 AI 可见设备
     void InitializeTools() {         
-        // auto& mcp_server = McpServer::GetInstance();
-        // mcp_server.AddTool("self.system.factory_reset", "恢复出厂设置，清除所有数据并重启进入配置模式", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-        //     auto& app = Application::GetInstance();
-        //     app.Schedule([&app]() {
-        //         ESP_LOGW(TAG, "User requested factory reset");
-        //         SystemReset systemReset(GPIO_NUM_NC, GPIO_NUM_NC);
-        //         systemReset.ResetToFactory();
-        //     });
-        //     return true;
-        // });
-        
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.system.reconfigure_wifi",
+            "End this conversation and enter WiFi configuration mode.\n"
+            "**CAUTION** You must ask the user to confirm this action.",
+            PropertyList(), [this](const PropertyList& properties) {
+                EnterWifiConfigMode();
+                return true;
+            });
+        mcp_server.AddTool("self.system.factory_reset", "恢复出厂设置，清除所有数据并重启进入配置模式", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            auto& app = Application::GetInstance();
+            app.Schedule([&app]() {
+                ESP_LOGW(TAG, "User requested factory reset");
+                SystemReset systemReset(GPIO_NUM_0, GPIO_NUM_0);
+                // systemReset.ResetWifi();
+                // systemReset.ResetNvsFlash();
+                systemReset.ResetToFactory();
+            });
+            return true;
+        });
     }
 
 public:
