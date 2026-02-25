@@ -143,6 +143,21 @@ private:
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
+    // Screen brightness control
+    esp_timer_handle_t screen_off_timer_ = nullptr;
+    uint8_t original_brightness_ = 100;
+    bool screen_is_off_ = false;
+    bool screen_is_dimmed_ = false;  // Track if screen has been dimmed in current idle session
+    uint32_t idle_session_id_ = 0;   // Incremented each time we enter idle from voice interaction
+    static constexpr uint8_t DIM_BRIGHTNESS = 5;
+    static constexpr int OFF_TIMEOUT_SECONDS = 300;  // Turn off after 5 minutes of no interaction
+
+    void StartScreenOffTimer();
+    void StopScreenOffTimer();
+    void DimScreen();
+    void TurnOffScreen();
+    void RestoreScreenBrightness();
+
 
     // Event handlers
     void HandleStateChangedEvent();

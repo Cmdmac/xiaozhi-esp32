@@ -44,12 +44,29 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+    // Create screen off timer - callback directly calls TurnOffScreen
+    esp_timer_create_args_t off_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            app->TurnOffScreen();
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "screen_off_timer",
+        .skip_unhandled_events = true  // Skip if previous callback still running
+    };
+    esp_timer_create(&off_timer_args, &screen_off_timer_);
 }
 
 Application::~Application() {
     if (clock_timer_handle_ != nullptr) {
         esp_timer_stop(clock_timer_handle_);
         esp_timer_delete(clock_timer_handle_);
+    }
+    if (screen_off_timer_ != nullptr) {
+        esp_timer_stop(screen_off_timer_);
+        esp_timer_delete(screen_off_timer_);
     }
     vEventGroupDelete(event_group_);
 }
@@ -803,7 +820,34 @@ void Application::HandleStateChangedEvent() {
     auto display = board.GetDisplay();
     auto led = board.GetLed();
     led->OnStateChanged();
-    
+
+    // Handle screen brightness based on state
+    auto backlight = board.GetBacklight();
+    if (backlight != nullptr) {
+        switch (new_state) {
+            case kDeviceStateListening:
+            case kDeviceStateSpeaking:
+                // Restore brightness when in voice interaction
+                RestoreScreenBrightness();
+                StopScreenOffTimer();
+                break;
+            case kDeviceStateIdle:
+                // Only dim screen when coming from voice interaction states
+                // if (old_state == kDeviceStateListening || old_state == kDeviceStateSpeaking) {
+                    // Dim screen immediately when entering idle state (after voice interaction)
+                    // and start timer to turn off screen after 5 minutes
+                    DimScreen();
+                    StartScreenOffTimer();
+                // }
+                break;
+            default:
+                // For other states, restore brightness and stop timers
+                RestoreScreenBrightness();
+                StopScreenOffTimer();
+                break;
+        }
+    }
+
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
@@ -1059,5 +1103,74 @@ void Application::ResetProtocol() {
         // Reset protocol
         protocol_.reset();
     });
+}
+
+void Application::StartScreenOffTimer() {
+    if (screen_off_timer_ == nullptr) {
+        return;
+    }
+
+    // Start off timer (5 minutes) to turn off screen
+    esp_timer_start_once(screen_off_timer_, OFF_TIMEOUT_SECONDS * 1000000ULL);
+
+    ESP_LOGI(TAG, "Screen off timer started: %d seconds", OFF_TIMEOUT_SECONDS);
+}
+
+void Application::StopScreenOffTimer() {
+    if (screen_off_timer_ != nullptr) {
+        esp_timer_stop(screen_off_timer_);
+    }
+}
+
+void Application::DimScreen() {
+    auto& board = Board::GetInstance();
+    auto backlight = board.GetBacklight();
+    if (backlight == nullptr) {
+        return;
+    }
+
+    // Save current brightness before dimming (only if not already dimmed/off)
+    uint8_t current = backlight->brightness();
+    if (!screen_is_off_ && current > DIM_BRIGHTNESS) {
+        original_brightness_ = current;
+        ESP_LOGI(TAG, "Saving original brightness: %d%%", original_brightness_);
+    }
+
+    ESP_LOGI(TAG, "Dimming screen to %d%%", DIM_BRIGHTNESS);
+    backlight->SetBrightness(DIM_BRIGHTNESS, false);
+}
+
+void Application::TurnOffScreen() {
+    // Only turn off screen if still in idle state
+    if (GetDeviceState() != kDeviceStateIdle) {
+        ESP_LOGI(TAG, "Skip turning off screen, not in idle state");
+        return;
+    }
+
+    auto& board = Board::GetInstance();
+    auto backlight = board.GetBacklight();
+    if (backlight == nullptr) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Turning off screen");
+    screen_is_off_ = true;
+    backlight->SetBrightness(0, false);
+}
+
+void Application::RestoreScreenBrightness() {
+    auto& board = Board::GetInstance();
+    auto backlight = board.GetBacklight();
+    if (backlight == nullptr) {
+        return;
+    }
+
+    // Always restore brightness when screen is off or dimmed
+    uint8_t current = backlight->brightness();
+    if (screen_is_off_ || current <= DIM_BRIGHTNESS) {
+        ESP_LOGI(TAG, "Restoring screen brightness from %d%% to %d%%", current, original_brightness_);
+        screen_is_off_ = false;
+        backlight->SetBrightness(original_brightness_, false);
+    }
 }
 
