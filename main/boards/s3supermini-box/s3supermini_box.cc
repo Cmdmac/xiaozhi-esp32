@@ -18,6 +18,8 @@
 #include <esp_lcd_panel_ops.h>
 #include <driver/spi_common.h>
 
+#include "alarm_manager.h"
+
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
 #endif
@@ -69,7 +71,7 @@ public:
                         gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout, gpio_num_t din,
                         gpio_num_t pa_pin, uint8_t es8311_addr, bool use_mclk = true)
         : Es8311AudioCodec(i2c_master_handle, i2c_port, input_sample_rate, output_sample_rate,
-                             mclk,  bclk,  ws,  dout,  din,pa_pin,  es8311_addr,  use_mclk = true) {}
+                             mclk,  bclk,  ws,  dout,  din,pa_pin,  es8311_addr,  use_mclk) {}
 
     void EnableOutput(bool enable) override {
         if (enable == output_enabled_) {
@@ -79,6 +81,17 @@ public:
             Es8311AudioCodec::EnableOutput(enable);
         } else {
            // Nothing todo because the display io and PA io conflict
+        }
+    }
+
+    void EnableInput(bool enable) override {
+        if (enable == input_enabled_) {
+            return;
+        }
+        if (enable) {
+            Es8311AudioCodec::EnableInput(enable);
+        } else {
+            // Keep input enabled to ensure wake word detection works
         }
     }
 };
@@ -201,6 +214,72 @@ private:
             });
             return true;
         });
+
+        // Alarm tools
+        mcp_server.AddTool("self.alarm.add",
+            "Add an alarm clock with specified time and optional label.",
+            PropertyList({
+                Property("hour", kPropertyTypeInteger, 0, 23),// "Hour of the alarm (0-23)"),
+                Property("minute", kPropertyTypeInteger, 0, 59), // "Minute of the alarm (0-59)"),
+                Property("label", kPropertyTypeString, std::string("")) // "Optional label for the alarm", "")
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                int hour = properties["hour"].value<int>();
+                int minute = properties["minute"].value<int>();
+                std::string label = properties["label"].value<std::string>();
+                
+                auto& alarm_manager = AlarmManager::GetInstance();
+                int alarm_id = alarm_manager.AddAlarm(hour, minute, label);
+                
+                char response[150];
+                snprintf(response, sizeof(response), "{\"success\": true, \"message\": \"Alarm set for %02d:%02d\", \"alarm_id\": %d}", hour, minute, alarm_id);
+                return std::string(response);
+            });
+
+        mcp_server.AddTool("self.alarm.remove",
+            "Remove an alarm by ID.",
+            PropertyList({
+                Property("alarm_id", kPropertyTypeInteger, 1, 100) // "Alarm ID to remove")
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                int alarm_id = properties["alarm_id"].value<int>();
+                
+                auto& alarm_manager = AlarmManager::GetInstance();
+                bool success = alarm_manager.RemoveAlarm(alarm_id);
+                
+                if (success) {
+                    return "{\"success\": true, \"message\": \"Alarm removed successfully\"}";
+                } else {
+                    return "{\"success\": false, \"message\": \"Failed to remove alarm\"}";
+                }
+            });
+
+        mcp_server.AddTool("self.alarm.list",
+            "List all configured alarms.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                auto& alarm_manager = AlarmManager::GetInstance();
+                const auto& alarms = alarm_manager.GetAlarms();
+                
+                if (alarms.empty()) {
+                    return "{\"success\": true, \"message\": \"No alarms set\", \"alarms\": []}";
+                }
+                
+                std::string response = "{\"success\": true, \"alarms\": [";
+                for (size_t i = 0; i < alarms.size(); i++) {
+                    const auto& alarm = alarms[i];
+                    char line[100];
+                    snprintf(line, sizeof(line), "{\"id\": %d, \"hour\": %d, \"minute\": %d, \"label\": \"%s\"}", 
+                            i + 1, alarm.GetHour(), alarm.GetMinute(), alarm.GetLabel().c_str());
+                    response += line;
+                    if (i < alarms.size() - 1) {
+                        response += ",";
+                    }
+                }
+                response += "]}";
+                
+                return response;
+            });
     }
 
 public:
@@ -208,6 +287,13 @@ public:
         boot_button_(BOOT_BUTTON_GPIO) {
         
         #ifdef AUDIO_CODEC_ES8311
+            gpio_config_t io_pa = {.pin_bit_mask = (1ULL << AUDIO_CODEC_PA_PIN),
+                               .mode = GPIO_MODE_OUTPUT,
+                               .pull_up_en = GPIO_PULLUP_DISABLE,
+                               .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                               .intr_type = GPIO_INTR_DISABLE};
+            gpio_config(&io_pa);
+            gpio_set_level(AUDIO_CODEC_PA_PIN, 0);
             InitializeCodecI2c();
         #endif
         InitializeSpi();
@@ -230,9 +316,13 @@ public:
         static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
 #elifdef AUDIO_CODEC_ES8311
+        // static SparkBotEs8311AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        //     AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
+        //     AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
         static SparkBotEs8311AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
+                                            AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS,
+                                            AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN, AUDIO_CODEC_PA_PIN,
+                                            AUDIO_CODEC_ES8311_ADDR, false);
 #else            
         static NoAudioCodecDuplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN);
