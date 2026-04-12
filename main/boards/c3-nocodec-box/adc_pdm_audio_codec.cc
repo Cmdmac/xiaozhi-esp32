@@ -147,9 +147,11 @@ void AdcPdmAudioCodec::SetOutputVolume(int volume) {
 }
 
 void AdcPdmAudioCodec::EnableInput(bool enable) {
+    ESP_LOGW(TAG, "EnableInput");
     if (enable == input_enabled_) {
         return;
     }
+    ESP_LOGW(TAG, "Set input enable to %s", enable ? "true" : "false");
     if (enable) {
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
@@ -213,6 +215,21 @@ int AdcPdmAudioCodec::Read(int16_t* dest, int samples) {
     if (input_enabled_) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
     }
+
+    // 添加日志：检查读取的数据
+    int16_t min_val = INT16_MAX;
+    int16_t max_val = INT16_MIN;
+    int non_zero_count = 0;
+    
+    for (int i = 0; i < samples; i++) {
+        if (dest[i] < min_val) min_val = dest[i];
+        if (dest[i] > max_val) max_val = dest[i];
+        if (dest[i] != 0) non_zero_count++;
+    }
+    
+    ESP_LOGI(TAG, "Audio data: samples=%d, min=%d, max=%d, non_zero=%d", 
+              samples, min_val, max_val, non_zero_count);
+
     return samples;
 }
 int AdcPdmAudioCodec::Write(const int16_t* data, int samples) {

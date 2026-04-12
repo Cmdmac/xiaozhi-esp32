@@ -24,7 +24,7 @@
 #include "driver/rmt_tx.h"
 #include "device_state.h"
 #include "system_reset.h"
-
+#include "alarm_manager.h"
 #include "sdkconfig.h"
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
@@ -184,26 +184,90 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();         
 
-        mcp_server.AddTool("self.system.reset_nvs", "重置NVS数据，清除所有配置信息", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            auto& app = Application::GetInstance();
-            app.Schedule([&app]() {
-                ESP_LOGW(TAG, "User requested NVS reset");
-                SystemReset system_reset(RESET_NVS_BUTTON_GPIO, RESET_FACTORY_BUTTON_GPIO);
-                system_reset.ResetNvsFlash();
-            });
-            return true;
-        });
+        // mcp_server.AddTool("self.system.reset_nvs", "重置NVS数据，清除所有配置信息", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+        //     auto& app = Application::GetInstance();
+        //     app.Schedule([&app]() {
+        //         ESP_LOGW(TAG, "User requested NVS reset");
+        //         SystemReset system_reset(RESET_NVS_BUTTON_GPIO, RESET_FACTORY_BUTTON_GPIO);
+        //         system_reset.ResetNvsFlash();
+        //     });
+        //     return true;
+        // });
 
-        mcp_server.AddTool("self.system.factory_reset", "恢复出厂设置，清除所有数据并重启进入配置模式", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            auto& app = Application::GetInstance();
-            app.Schedule([&app]() {
-                ESP_LOGW(TAG, "User requested factory reset");
-                SystemReset system_reset(RESET_NVS_BUTTON_GPIO, RESET_FACTORY_BUTTON_GPIO);
-                system_reset.ResetToFactory();
+        // mcp_server.AddTool("self.system.factory_reset", "恢复出厂设置，清除所有数据并重启进入配置模式", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+        //     auto& app = Application::GetInstance();
+        //     app.Schedule([&app]() {
+        //         ESP_LOGW(TAG, "User requested factory reset");
+        //         SystemReset system_reset(RESET_NVS_BUTTON_GPIO, RESET_FACTORY_BUTTON_GPIO);
+        //         system_reset.ResetToFactory();
+        //     });
+        //     return true;
+        // });
+        // Alarm tools
+        mcp_server.AddTool("self.alarm.add",
+            "Add an alarm clock with specified time and optional label.",
+            PropertyList({
+                Property("hour", kPropertyTypeInteger, 0, 23),// "Hour of the alarm (0-23)"),
+                Property("minute", kPropertyTypeInteger, 0, 59), // "Minute of the alarm (0-59)"),
+                Property("label", kPropertyTypeString, std::string("")) // "Optional label for the alarm", "")
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                int hour = properties["hour"].value<int>();
+                int minute = properties["minute"].value<int>();
+                std::string label = properties["label"].value<std::string>();
+                
+                auto& alarm_manager = AlarmManager::GetInstance();
+                int alarm_id = alarm_manager.AddAlarm(hour, minute, label);
+                
+                char response[150];
+                snprintf(response, sizeof(response), "{\"success\": true, \"message\": \"Alarm set for %02d:%02d\", \"alarm_id\": %d}", hour, minute, alarm_id);
+                return std::string(response);
             });
-            return true;
-        });
-        
+
+        mcp_server.AddTool("self.alarm.remove",
+            "Remove an alarm by ID.",
+            PropertyList({
+                Property("alarm_id", kPropertyTypeInteger, 1, 100) // "Alarm ID to remove")
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                int alarm_id = properties["alarm_id"].value<int>();
+                
+                auto& alarm_manager = AlarmManager::GetInstance();
+                bool success = alarm_manager.RemoveAlarm(alarm_id);
+                
+                if (success) {
+                    return "{\"success\": true, \"message\": \"Alarm removed successfully\"}";
+                } else {
+                    return "{\"success\": false, \"message\": \"Failed to remove alarm\"}";
+                }
+            });
+
+        mcp_server.AddTool("self.alarm.list",
+            "List all configured alarms.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                auto& alarm_manager = AlarmManager::GetInstance();
+                const auto& alarms = alarm_manager.GetAlarms();
+                
+                if (alarms.empty()) {
+                    return "{\"success\": true, \"message\": \"No alarms set\", \"alarms\": []}";
+                }
+                
+                std::string response = "{\"success\": true, \"alarms\": [";
+                for (size_t i = 0; i < alarms.size(); i++) {
+                    const auto& alarm = alarms[i];
+                    char line[100];
+                    snprintf(line, sizeof(line), "{\"id\": %d, \"hour\": %d, \"minute\": %d, \"label\": \"%s\"}", 
+                            i + 1, alarm.GetHour(), alarm.GetMinute(), alarm.GetLabel().c_str());
+                    response += line;
+                    if (i < alarms.size() - 1) {
+                        response += ",";
+                    }
+                }
+                response += "]}";
+                
+                return response;
+            });
     }
 
 public:
@@ -224,7 +288,7 @@ public:
             AUDIO_INPUT_SAMPLE_RATE,
             AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_ADC_MIC_CHANNEL,
-            AUDIO_PDM_SPEAK_P_GPIO,
+            AUDIO_PDM_SPEAK_P_GPIO, 
             AUDIO_PDM_SPEAK_N_GPIO,
             AUDIO_PA_CTL_GPIO);
         return &audio_codec;
