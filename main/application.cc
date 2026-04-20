@@ -1,5 +1,6 @@
 #include "application.h"
 #include "board.h"
+#include "wifi_board.h"
 #include "display.h"
 #include "system_info.h"
 #include "audio_codec.h"
@@ -16,9 +17,9 @@
 #include <driver/gpio.h>
 #include <arpa/inet.h>
 #include <font_awesome.h>
+#include "codecs/mix_audio_codec.h"
 
 #define TAG "Application"
-
 
 Application::Application() {
     event_group_ = xEventGroupCreate();
@@ -622,6 +623,32 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->Start();
+
+    // 初始化 OpenClawWebSocket 连接
+    openclaw_websocket_ = std::make_unique<OpenClawWebSocket>();
+    openclaw_websocket_->SetOpusDataCallback([this](const std::vector<uint8_t>& data) {
+        ESP_LOGW(TAG, "Received OPUS data: %u", data.size());
+        // 创建 AudioStreamPacket
+            // 确保 openclaw_wakeup_packet_ 已初始化
+        // if (!openclaw_wakeup_packet_) {
+        //     openclaw_wakeup_packet_ = std::make_unique<AudioStreamPacket>();
+        // }
+        // openclaw_wakeup_packet_->payload = data;
+        // openclaw_wakeup_packet_->sample_rate = 16000; // 默认采样率
+        // openclaw_wakeup_packet_->frame_duration = 60; // 默认帧时长
+
+        WakeUpFromOpenClaw(data);
+        
+    });
+
+    if (!openclaw_websocket_->IsConnected()) {
+        ESP_LOGW(TAG, "Connecting to WebSocket server...");
+        if (openclaw_websocket_->Connect("ws://47.112.18.149:8765/websocket")) {
+            ESP_LOGW(TAG, "Connected to WebSocket server");
+            // openclaw_websocket_->SendText("hello");
+        }
+    }
+    
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -847,7 +874,7 @@ void Application::HandleStateChangedEvent() {
                 break;
         }
     }
-
+    ESP_LOGW(TAG, "State changed to %d", new_state);
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
@@ -1035,6 +1062,78 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
             }
         });
     }
+}
+
+void Application::WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data) {
+    auto audio_codec = WifiBoard::GetInstance().GetAudioCodec();    
+    MixAudioCodec* mix_codec = dynamic_cast<MixAudioCodec*>(audio_codec);
+    if (!mix_codec) {
+        ESP_LOGE(TAG, "Audio codec is not MixAudioCodec");
+        return;
+    }
+    std::vector<int16_t> pcm_data;        
+    if (ws_data.size() % 2 != 0) {
+        ESP_LOGW("WebSocketCodec", "Data size is odd, last byte will be ignored");
+    }
+    
+    size_t sample_count = ws_data.size() / 2;
+    pcm_data.resize(sample_count);
+    
+    if (sample_count > 0) {
+        std::memcpy(pcm_data.data(), ws_data.data(), sample_count * 2);
+    }
+    
+    //保存数据 到 WebSocketCodec
+    mix_codec->writeFromWS(pcm_data.data(), pcm_data.size());
+            
+    
+    if (!protocol_) {
+        ESP_LOGE(TAG, "Protocol not initialized");
+        return;
+    }
+
+    // auto state = GetDeviceState();
+    // ESP_LOGW(TAG, "Current device state: %d", state);
+    // if (state == kDeviceStateIdle) {
+    //     if (!protocol_->IsAudioChannelOpened()) {
+    //         SetDeviceState(kDeviceStateConnecting);
+    //         if (!protocol_->OpenAudioChannel()) {
+    //             ESP_LOGE(TAG, "Failed to open audio channel");
+    //             return;
+    //         }
+    //     }        
+    //     ESP_LOGW(TAG, "Audio channel opened SetListeningMode");
+    //     SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+    // } else if (state == kDeviceStateSpeaking) {
+    //     AbortSpeaking(kAbortReasonNone);
+    // } else if (state == kDeviceStateActivating) {
+    //     // 与语音唤醒流程保持一致
+    //     SetDeviceState(kDeviceStateIdle);
+    // } else if (state == kDeviceStateListening) {
+    //     if (!protocol_->IsAudioChannelOpened()) {
+    //         SetDeviceState(kDeviceStateConnecting);
+    //         if (!protocol_->OpenAudioChannel()) {
+    //             ESP_LOGE(TAG, "Failed to open audio channel");
+    //             return;
+    //         }
+    //     }        
+    //     // onGetOpenClawWebMsg(openclaw_wakeup_packet_);
+    //     // openclaw_wakeup_packet_.reset();
+    // }
+}
+
+void Application::onGetOpenClawWebMsg(std::unique_ptr<AudioStreamPacket> &packet) {
+    if (!protocol_) {
+        return;
+    }
+
+    bool result = protocol_->SendAudio(std::move(packet));
+    if (!result) {
+        ESP_LOGE(TAG, "Failed to send audio packet");
+    }
+    protocol_->SendWakeWordDetected("查看回复");
+    ((WifiBoard&)Board::GetInstance()).GetAudioCodec()->EnableOutput(true);
+    
 }
 
 bool Application::CanEnterSleepMode() {

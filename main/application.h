@@ -12,6 +12,7 @@
 #include <memory>
 
 #include "protocol.h"
+#include "openclaw_websocket.h"
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state.h"
@@ -31,6 +32,7 @@
 #define MAIN_EVENT_START_LISTENING      (1 << 10)
 #define MAIN_EVENT_STOP_LISTENING       (1 << 11)
 #define MAIN_EVENT_STATE_CHANGED        (1 << 12)
+#define MAIN_EVENT_OPENCLAW_WAKEUP      (1 << 13)
 
 
 enum AecMode {
@@ -105,6 +107,7 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
+    void WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
@@ -113,6 +116,8 @@ public:
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     
+    void onGetOpenClawWebMsg(std::unique_ptr<AudioStreamPacket> &packet);
+    OpenClawWebSocket& GetOpenClawWebSocket() { return *openclaw_websocket_; }
     /**
      * Reset protocol resources (thread-safe)
      * Can be called from any task to release resources allocated after network connected
@@ -127,6 +132,7 @@ private:
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
+    std::unique_ptr<OpenClawWebSocket> openclaw_websocket_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
     DeviceStateMachine state_machine_;
