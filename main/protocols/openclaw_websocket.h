@@ -35,7 +35,7 @@ private:
     EventGroupHandle_t event_group_;
     AudioDataCallback audio_data_callback_;
 
-    bool isReceived_;
+    bool isReceiving_;
     AudioType binaryType_; //0-wav,1-opus
     
 };

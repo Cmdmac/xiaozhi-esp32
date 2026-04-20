@@ -62,7 +62,7 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
             std::vector<std::string> cmd_parts = split(command, '=');
             //开始发送
             if (cmd_parts.size() ==2 && cmd_parts[0] == "start_send") {
-                isReceived_ = true;
+                isReceiving_ = true;
 
                 std::string type = split(parts[1], '=')[1];
                 std::string file_size = split(parts[2], '=')[1];
@@ -76,7 +76,7 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
                 }
             } else if (cmd_parts.size() ==2 && cmd_parts[0] == "end_send") {
                 //结束发送
-                isReceived_ = false;
+                isReceiving_ = false;
             }
             
         }
