@@ -10,9 +10,14 @@
 #include <memory>
 #include <web_socket.h>
 
+enum class AudioType {
+    WAV,
+    OGG
+};
+
 class OpenClawWebSocket {
 public:
-    typedef std::function<void(const std::vector<uint8_t>&)> OpusDataCallback;
+    typedef std::function<void(const std::vector<uint8_t>&, AudioType type)> AudioDataCallback;
     
     OpenClawWebSocket();
     ~OpenClawWebSocket();
@@ -21,18 +26,18 @@ public:
     void Disconnect();
     bool IsConnected() const;
     
-    void SetOpusDataCallback(OpusDataCallback callback);
+    void SetAudioDataCallback(AudioDataCallback callback);
     bool SendText(const std::string& text);
     bool SendBinary(const std::vector<uint8_t>& data);
     
 private:
     std::unique_ptr<WebSocket> websocket_;
     EventGroupHandle_t event_group_;
-    OpusDataCallback opus_data_callback_;
+    AudioDataCallback audio_data_callback_;
+
+    bool isReceived_;
+    AudioType binaryType_; //0-wav,1-opus
     
-    void ProcessOpusData(const uint8_t* data, size_t size);
-    bool IsOggContainer(const uint8_t* data, size_t size);
-    void ParseOggContainer(const uint8_t* data, size_t size);
 };
 
 #endif

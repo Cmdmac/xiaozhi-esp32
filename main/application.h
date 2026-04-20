@@ -107,7 +107,7 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
-    void WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data);
+    void WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data, AudioType binaryType);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
