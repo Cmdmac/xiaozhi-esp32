@@ -811,3 +811,18 @@ bool AudioService::IsAfeWakeWord() {
     return false;
 #endif
 }
+
+//加到发送队列
+void AudioService::PushTaskToSendQueue(std::vector<int8_t>&& opus) {
+    auto packet = std::make_unique<AudioStreamPacket>();
+    packet->sample_rate = 16000;//codec_->input_sample_rate();
+    packet->frame_duration = 60;
+    packet->payload.assign(opus.data(), opus.data() + opus.size());
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    audio_send_queue_.push_back(std::move(packet));
+    audio_queue_cv_.notify_one();
+
+    if (callbacks_.on_send_queue_available) {
+        callbacks_.on_send_queue_available();
+    }
+}

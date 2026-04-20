@@ -637,7 +637,7 @@ void Application::InitializeProtocol() {
         // openclaw_wakeup_packet_->sample_rate = 16000; // 默认采样率
         // openclaw_wakeup_packet_->frame_duration = 60; // 默认帧时长
 
-        WakeUpFromOpenClaw(data);
+        WakeUpFromOpenClaw(data, type);
         
     });
 
