@@ -134,7 +134,7 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
-    void PushTaskToSendQueue(std::vector<int8_t>&& opus);
+    void PushTaskToSendQueue(const std::vector<uint8_t>& opus);
 
 private:
     AudioCodec* codec_ = nullptr;

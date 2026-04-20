@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include "application.h"
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -762,13 +763,22 @@ void AudioService::ResetDecoder() {
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {
+    //是idle状态才关闭输入输出
+    // DeviceState deviceState = Application::GetInstance().GetDeviceState();
+    // bool isIdle = (deviceState != DeviceState::kDeviceStateListening && deviceState != DeviceState::kDeviceStateSpeaking);
+    // if (!isIdle) {
+    //     return;
+    // }
     auto now = std::chrono::steady_clock::now();
     auto input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
     auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
+        
     if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
         codec_->EnableInput(false);
     }
+
     if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
+        ESP_LOGW(TAG, "Output power timeout, disable output");
         codec_->EnableOutput(false);
     }
     if (!codec_->input_enabled() && !codec_->output_enabled()) {
@@ -813,7 +823,7 @@ bool AudioService::IsAfeWakeWord() {
 }
 
 //加到发送队列
-void AudioService::PushTaskToSendQueue(std::vector<int8_t>&& opus) {
+void AudioService::PushTaskToSendQueue(const std::vector<uint8_t>& opus) {
     auto packet = std::make_unique<AudioStreamPacket>();
     packet->sample_rate = 16000;//codec_->input_sample_rate();
     packet->frame_duration = 60;

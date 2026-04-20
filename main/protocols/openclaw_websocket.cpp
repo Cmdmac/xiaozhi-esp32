@@ -16,6 +16,7 @@ std::vector<std::string> split(const std::string& s, char delimiter) {
     
     // 使用 getline 按指定分隔符读取
     while (std::getline(tokenStream, token, delimiter)) {
+        // ESP_LOGI(TAG, "Token: %s", token.c_str());
         tokens.push_back(token);
     }
     return tokens;
@@ -46,7 +47,7 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
     
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {
-            ESP_LOGW(TAG, "Received binary data: %u", len);
+            ESP_LOGW(TAG, "Received binary data: %u, type: %d", len, static_cast<int>(binaryType_));
             std::vector<uint8_t> opus_data(data, data + len);
             audio_data_callback_(opus_data, binaryType_);
         } else {
@@ -54,14 +55,14 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
             std::string header(data, len);
             //cmd=start_send,type={type},file_size={file_size}
             std::vector<std::string> parts = split(header, ',');
-            if (parts.size() != 3) {
-                ESP_LOGE(TAG, "Invalid header format");
+            if (parts.size() < 1) {
+                ESP_LOGE(TAG, "Invalid header format parts: %d", parts.size());
                 return;
             }
             std::string command = parts[0];
             std::vector<std::string> cmd_parts = split(command, '=');
             //开始发送
-            if (cmd_parts.size() ==2 && cmd_parts[0] == "start_send") {
+            if (cmd_parts.size() == 2 && cmd_parts[0] == "cmd" && cmd_parts[1] == "start_send") {
                 isReceiving_ = true;
 
                 std::string type = split(parts[1], '=')[1];
@@ -74,7 +75,7 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
                     ESP_LOGE(TAG, "Invalid type");
                     return;
                 }
-            } else if (cmd_parts.size() ==2 && cmd_parts[0] == "end_send") {
+            } else if (cmd_parts.size() == 2 && cmd_parts[0] == "cmd" && cmd_parts[1] == "end_send") {
                 //结束发送
                 isReceiving_ = false;
             }

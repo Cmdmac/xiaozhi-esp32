@@ -637,8 +637,7 @@ void Application::InitializeProtocol() {
         // openclaw_wakeup_packet_->sample_rate = 16000; // 默认采样率
         // openclaw_wakeup_packet_->frame_duration = 60; // 默认帧时长
 
-        WakeUpFromOpenClaw(data, type);
-        
+        WakeUpFromOpenClaw(data, type);        
     });
 
     if (!openclaw_websocket_->IsConnected()) {
@@ -1072,6 +1071,7 @@ void Application::WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data, AudioT
         return;
     }
     if (binaryType == AudioType::WAV) {
+        ESP_LOGI(TAG, "WakeUpFromOpenClaw Received WAV data");
         //如果是pcm数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         std::vector<int16_t> pcm_data;        
         if (ws_data.size() % 2 != 0) {
@@ -1086,7 +1086,8 @@ void Application::WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data, AudioT
         mix_codec->writeFromWS(pcm_data.data(), pcm_data.size());            
     } else if (binaryType == AudioType::OGG) {
         //如果是ogg数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
-        //mix_codec->writeFromWS(ws_data.data(), ws_data.size());            
+        //mix_codec->writeFromWS(ws_data.data(), ws_data.size());      
+        audio_service_.PushTaskToSendQueue(ws_data);
     }
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
