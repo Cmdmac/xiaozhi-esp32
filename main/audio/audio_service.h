@@ -23,7 +23,7 @@
 #include "processors/audio_debugger.h"
 #include "wake_word.h"
 #include "protocol.h"
-
+#include "openclaw_websocket.h"
 
 /*
  * There are two types of audio data flow:
@@ -135,6 +135,7 @@ public:
     void SetModelsList(srmodel_list_t* models_list);
 
     void PushTaskToSendQueue(const std::vector<uint8_t>& opus);
+    void ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType, bool isFinish);
 
 private:
     AudioCodec* codec_ = nullptr;

@@ -626,18 +626,13 @@ void Application::InitializeProtocol() {
 
     // 初始化 OpenClawWebSocket 连接
     openclaw_websocket_ = std::make_unique<OpenClawWebSocket>();
-    openclaw_websocket_->SetAudioDataCallback([this](const std::vector<uint8_t>& data, AudioType type) {
-        ESP_LOGW(TAG, "Received OPUS data: %u", data.size());
-        // 创建 AudioStreamPacket
-            // 确保 openclaw_wakeup_packet_ 已初始化
-        // if (!openclaw_wakeup_packet_) {
-        //     openclaw_wakeup_packet_ = std::make_unique<AudioStreamPacket>();
-        // }
-        // openclaw_wakeup_packet_->payload = data;
-        // openclaw_wakeup_packet_->sample_rate = 16000; // 默认采样率
-        // openclaw_wakeup_packet_->frame_duration = 60; // 默认帧时长
-
-        WakeUpFromOpenClaw(data, type);        
+    openclaw_websocket_->SetAudioDataCallback([this](const std::vector<uint8_t>& data, AudioType audioType, bool isFinish) {
+        audio_service_.ReceiveFromOpenClaw(data, audioType, isFinish);
+        if (isFinish) {
+            ESP_LOGI(TAG, "WakeUpFromOpenClaw Received finish signal");
+            xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
+            WakeUpFromOpenClaw();           
+        }
     });
 
     if (!openclaw_websocket_->IsConnected()) {
@@ -1063,32 +1058,8 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     }
 }
 
-void Application::WakeUpFromOpenClaw(const std::vector<uint8_t>& ws_data, AudioType binaryType) {
-    auto audio_codec = WifiBoard::GetInstance().GetAudioCodec();    
-    MixAudioCodec* mix_codec = dynamic_cast<MixAudioCodec*>(audio_codec);
-    if (!mix_codec) {
-        ESP_LOGE(TAG, "Audio codec is not MixAudioCodec");
-        return;
-    }
-    if (binaryType == AudioType::WAV) {
-        ESP_LOGI(TAG, "WakeUpFromOpenClaw Received WAV data");
-        //如果是pcm数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
-        std::vector<int16_t> pcm_data;        
-        if (ws_data.size() % 2 != 0) {
-            ESP_LOGW("WebSocketCodec", "Data size is odd, last byte will be ignored");
-        }    
-        size_t sample_count = ws_data.size() / 2;
-        pcm_data.resize(sample_count);    
-        if (sample_count > 0) {
-            std::memcpy(pcm_data.data(), ws_data.data(), sample_count * 2);
-        }    
-        //保存数据 到 WebSocketCodec
-        mix_codec->writeFromWS(pcm_data.data(), pcm_data.size());            
-    } else if (binaryType == AudioType::OGG) {
-        //如果是ogg数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
-        //mix_codec->writeFromWS(ws_data.data(), ws_data.size());      
-        audio_service_.PushTaskToSendQueue(ws_data);
-    }
+void Application::WakeUpFromOpenClaw() {
+    
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;

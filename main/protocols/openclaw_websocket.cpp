@@ -49,7 +49,7 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
         if (binary) {
             ESP_LOGW(TAG, "Received binary data: %u, type: %d", len, static_cast<int>(binaryType_));
             std::vector<uint8_t> opus_data(data, data + len);
-            audio_data_callback_(opus_data, binaryType_);
+            audio_data_callback_(opus_data, binaryType_, isReceiving_);
         } else {
             ESP_LOGI(TAG, "Received text: %.*s", len, data);
             std::string header(data, len);

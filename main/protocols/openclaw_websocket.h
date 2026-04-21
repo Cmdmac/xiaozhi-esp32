@@ -17,7 +17,7 @@ enum class AudioType {
 
 class OpenClawWebSocket {
 public:
-    typedef std::function<void(const std::vector<uint8_t>&, AudioType type)> AudioDataCallback;
+    typedef std::function<void(const std::vector<uint8_t>&, AudioType audioType, bool isFinish)> AudioDataCallback;
     
     OpenClawWebSocket();
     ~OpenClawWebSocket();
