@@ -845,7 +845,7 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopFromOpenClawSendQueue() {
     return packet;
 }
 
-void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType, bool isFinish) {
+void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType) {
     // 创建 AudioStreamPacket
         // 确保 openclaw_wakeup_packet_ 已初始化
     // if (!openclaw_wakeup_packet_) {
@@ -860,8 +860,8 @@ void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioTy
         ESP_LOGE(TAG, "Audio codec is not MixAudioCodec");
         return;
     }
-    if (audioType == AudioType::WAV) {
-        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received WAV data");
+    if (audioType == AudioType::WAV_STREAM) {
+        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received WAV_STREAM data");
         //如果是pcm数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         std::vector<int16_t> pcm_data;        
         if (data.size() % 2 != 0) {
@@ -874,11 +874,16 @@ void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioTy
         }    
         //保存数据 到 WebSocketCodec
         mix_codec->writeFromWS(pcm_data.data(), pcm_data.size());            
-    } else if (audioType == AudioType::OGG) {
+    } else if (audioType == AudioType::OGG_STREAM) {
+        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received OGG_STREAM data");
+        PushTaskToOpenClawSendQueue(data);
+    } else if (audioType == AudioType::WAV_FILE) {
+        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received WAV_FILE data");
+    } else if (audioType == AudioType::OGG_FILE) {
         //如果是ogg数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         //mix_codec->writeFromWS(ws_data.data(), ws_data.size());      
         //PushTaskToOpenClawSendQueue(data);
-        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received OGG data");
+        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received OGG_FILE data");
         OggParser parser;
         std::vector<std::vector<uint8_t>> opus_frames = parser.Parse(data.data(), data.size());
         ESP_LOGI(TAG, "ParseOgg %d frames", opus_frames.size());

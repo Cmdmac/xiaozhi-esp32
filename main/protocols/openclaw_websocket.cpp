@@ -47,9 +47,9 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
     
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {
-            ESP_LOGW(TAG, "Received binary data: %u, type: %d", len, static_cast<int>(binaryType_));
+            // ESP_LOGW(TAG, "Received binary data: %u, type: %d", len, static_cast<int>(binaryType_));
             std::vector<uint8_t> opus_data(data, data + len);
-            audio_data_callback_(opus_data, binaryType_, isReceiving_);
+            callbacks_.on_audio_data_callback(opus_data, binaryType_);
         } else {
             ESP_LOGI(TAG, "Received text: %.*s", len, data);
             std::string header(data, len);
@@ -63,21 +63,24 @@ bool OpenClawWebSocket::Connect(const std::string& url) {
             std::vector<std::string> cmd_parts = split(command, '=');
             //开始发送
             if (cmd_parts.size() == 2 && cmd_parts[0] == "cmd" && cmd_parts[1] == "start_send") {
-                isReceiving_ = true;
-
                 std::string type = split(parts[1], '=')[1];
                 std::string file_size = split(parts[2], '=')[1];
-                if (type == "wav") {
-                    binaryType_ = AudioType::WAV;
-                } else if (type == "ogg") {
-                    binaryType_ = AudioType::OGG;
+                if (type == "wav_stream") {
+                    binaryType_ = AudioType::WAV_STREAM;
+                } else if (type == "ogg_stream") {
+                    binaryType_ = AudioType::OGG_STREAM;
+                } else if (type == "wav_file") {
+                    binaryType_ = AudioType::WAV_FILE;
+                } else if (type == "ogg_file") {
+                    binaryType_ = AudioType::OGG_FILE;
                 } else {
                     ESP_LOGE(TAG, "Invalid type");
                     return;
                 }
+                callbacks_.on_start_send_audio(binaryType_, std::stoll(file_size));
             } else if (cmd_parts.size() == 2 && cmd_parts[0] == "cmd" && cmd_parts[1] == "end_send") {
                 //结束发送
-                isReceiving_ = false;
+                callbacks_.on_end_send_audio(binaryType_);
             }
             
         }
@@ -104,8 +107,8 @@ bool OpenClawWebSocket::IsConnected() const {
     return websocket_ && websocket_->IsConnected();
 }
 
-void OpenClawWebSocket::SetAudioDataCallback(AudioDataCallback callback) {
-    audio_data_callback_ = callback;
+void OpenClawWebSocket::SetCallbacks(OpenClawWebSocketCallbacks callback) {
+    callbacks_ = callback;
 }
 
 bool OpenClawWebSocket::SendText(const std::string& text) {

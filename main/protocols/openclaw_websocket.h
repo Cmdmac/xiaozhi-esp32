@@ -11,14 +11,20 @@
 #include <web_socket.h>
 
 enum class AudioType {
-    WAV,
-    OGG
+    WAV_STREAM,
+    WAV_FILE,
+    OGG_STREAM,
+    OGG_FILE,
+};
+
+struct OpenClawWebSocketCallbacks {
+    std::function<void(const std::vector<uint8_t>&, AudioType audioType)> on_audio_data_callback;
+    std::function<void(AudioType audioType, size_t fileSize)> on_start_send_audio;
+    std::function<void(AudioType audioType)> on_end_send_audio;
 };
 
 class OpenClawWebSocket {
-public:
-    typedef std::function<void(const std::vector<uint8_t>&, AudioType audioType, bool isFinish)> AudioDataCallback;
-    
+public:    
     OpenClawWebSocket();
     ~OpenClawWebSocket();
     
@@ -26,14 +32,14 @@ public:
     void Disconnect();
     bool IsConnected() const;
     
-    void SetAudioDataCallback(AudioDataCallback callback);
+    void SetCallbacks(OpenClawWebSocketCallbacks callback);
     bool SendText(const std::string& text);
     bool SendBinary(const std::vector<uint8_t>& data);
     
 private:
     std::unique_ptr<WebSocket> websocket_;
     EventGroupHandle_t event_group_;
-    AudioDataCallback audio_data_callback_;
+    OpenClawWebSocketCallbacks callbacks_;
 
     bool isReceiving_;
     AudioType binaryType_; //0-wav,1-opus

@@ -626,12 +626,19 @@ void Application::InitializeProtocol() {
 
     // 初始化 OpenClawWebSocket 连接
     openclaw_websocket_ = std::make_unique<OpenClawWebSocket>();
-    openclaw_websocket_->SetAudioDataCallback([this](const std::vector<uint8_t>& data, AudioType audioType, bool isFinish) {
-        audio_service_.ReceiveFromOpenClaw(data, audioType, isFinish);
-        if (isFinish) {
-            WakeUpFromOpenClaw();         
-        }
-    });
+    OpenClawWebSocketCallbacks callbacks;
+    callbacks.on_audio_data_callback = [this](const std::vector<uint8_t>& data, AudioType audioType) {
+        // ESP_LOGI(TAG, "ReceiveFromOpenClaw audioType: %d", audioType);             
+        audio_service_.ReceiveFromOpenClaw(data, audioType);
+    };
+    callbacks.on_start_send_audio = [this](AudioType audioType, size_t size) {
+        ESP_LOGW(TAG, "Start receive audio: %d, size: %d", audioType, size);
+    };
+    callbacks.on_end_send_audio = [this](AudioType audioType) {
+        ESP_LOGW(TAG, "End receive audio: %d", audioType);
+        WakeUpFromOpenClaw();    
+    };
+    openclaw_websocket_->SetCallbacks(callbacks);
 
     if (!openclaw_websocket_->IsConnected()) {
         ESP_LOGW(TAG, "Connecting to WebSocket server...");
@@ -1069,7 +1076,7 @@ void Application::WakeUpFromOpenClaw() {
     }
 
     auto state = GetDeviceState();
-    ESP_LOGW(TAG, "Current device state: %d", state);
+    ESP_LOGW(TAG, "WakeUpFromOpenClaw Current device state: %d", state);
     if (state == kDeviceStateIdle) {
         if (!protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);

@@ -136,7 +136,7 @@ public:
 
     void PushTaskToOpenClawSendQueue(const std::vector<uint8_t>& opus);
     std::unique_ptr<AudioStreamPacket> PopFromOpenClawSendQueue();
-    void ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType, bool isFinish);
+    void ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType);
 
 private:
     AudioCodec* codec_ = nullptr;
