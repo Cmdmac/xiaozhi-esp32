@@ -629,12 +629,6 @@ void Application::InitializeProtocol() {
     openclaw_websocket_->SetAudioDataCallback([this](const std::vector<uint8_t>& data, AudioType audioType, bool isFinish) {
         audio_service_.ReceiveFromOpenClaw(data, audioType, isFinish);
         if (isFinish) {
-            // 禁用本地音频输入
-            auto audio_codec = WifiBoard::GetInstance().GetAudioCodec();
-            // audio_codec->EnableInput(false);
-            while(auto packet = audio_service_.PopFromOpenClawSendQueue()){
-                protocol_->SendAudio(std::move(packet));
-            }
             WakeUpFromOpenClaw();         
         }
     });
@@ -900,6 +894,10 @@ void Application::HandleStateChangedEvent() {
                 
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
+                //在开始读取本地音频时发送来自MCP Server的音频
+                while(auto packet = audio_service_.PopFromOpenClawSendQueue()){
+                    protocol_->SendAudio(std::move(packet));
+                }
                 audio_service_.EnableVoiceProcessing(true);
                 audio_service_.EnableWakeWordDetection(false);
             }
@@ -1094,23 +1092,7 @@ void Application::WakeUpFromOpenClaw() {
                 return;
             }
         }        
-        // onGetOpenClawWebMsg(openclaw_wakeup_packet_);
-        // openclaw_wakeup_packet_.reset();
     }
-}
-
-void Application::onGetOpenClawWebMsg(std::unique_ptr<AudioStreamPacket> &packet) {
-    if (!protocol_) {
-        return;
-    }
-
-    bool result = protocol_->SendAudio(std::move(packet));
-    if (!result) {
-        ESP_LOGE(TAG, "Failed to send audio packet");
-    }
-    protocol_->SendWakeWordDetected("查看回复");
-    ((WifiBoard&)Board::GetInstance()).GetAudioCodec()->EnableOutput(true);
-    
 }
 
 bool Application::CanEnterSleepMode() {

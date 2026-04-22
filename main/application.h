@@ -107,7 +107,6 @@ public:
 
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
-    void WakeUpFromOpenClaw();
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
     bool CanEnterSleepMode();
     void SendMcpMessage(const std::string& payload);
@@ -116,7 +115,7 @@ public:
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
     
-    void onGetOpenClawWebMsg(std::unique_ptr<AudioStreamPacket> &packet);
+    void WakeUpFromOpenClaw();
     OpenClawWebSocket& GetOpenClawWebSocket() { return *openclaw_websocket_; }
     /**
      * Reset protocol resources (thread-safe)
