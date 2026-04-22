@@ -861,7 +861,7 @@ void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioTy
         return;
     }
     if (audioType == AudioType::WAV) {
-        ESP_LOGI(TAG, "WakeUpFromOpenClaw Received WAV data");
+        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received WAV data");
         //如果是pcm数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         std::vector<int16_t> pcm_data;        
         if (data.size() % 2 != 0) {
@@ -878,6 +878,7 @@ void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioTy
         //如果是ogg数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         //mix_codec->writeFromWS(ws_data.data(), ws_data.size());      
         //PushTaskToOpenClawSendQueue(data);
+        ESP_LOGI(TAG, "ReceiveFromOpenClaw Received OGG data");
         OggParser parser;
         std::vector<std::vector<uint8_t>> opus_frames = parser.Parse(data.data(), data.size());
         ESP_LOGI(TAG, "ParseOgg %d frames", opus_frames.size());
