@@ -4,7 +4,7 @@
 
 const char* WebSocketCodec::TAG = "WebSocketCodec";
 
-bool WebSocketCodec::IsOggContainer(const uint8_t* data, size_t size) {
+bool WebSocketCodec::IsOgg(const uint8_t* data, size_t size) {
     return size >= 4 && 
            data[0] == 'O' && 
            data[1] == 'g' && 
@@ -12,90 +12,126 @@ bool WebSocketCodec::IsOggContainer(const uint8_t* data, size_t size) {
            data[3] == 'S';
 }
 
-void WebSocketCodec::ParseOggContainer(const uint8_t* data, size_t size) {
-    std::vector<uint8_t> accumulated_opus_data_;  // 累积的 OPUS 数据
-    bool is_receiving_file_ = false;              // 是否正在接收文件
-    bool is_file_complete_ = false;               // 文件是否接收完成
-    
-    size_t offset = 0;
-    while (offset < size) {
-        // 检查 Ogg 页头
-        if (offset + 27 > size) {
-            break;
-        }
+struct OpusHead {
+    uint8_t version;           // 版本号
+    uint8_t channel_count;     // 通道数
+    uint16_t pre_skip;         // 预跳过样本数
+    uint32_t sample_rate;      // 输入采样率
+    int16_t output_gain;       // 输出增益
+    uint8_t mapping_family;    // 通道映射族
+};
 
-        // 验证 Ogg 魔法字节
-        if (memcmp(data + offset, "OggS", 4) != 0) {
-            ESP_LOGE(TAG, "Invalid Ogg header");
-            break;
-        }
-
-        // 解析页头信息
-        uint8_t header_type_flag = data[offset + 5];  // 第5字节是头类型标志
-        bool is_last_page = (header_type_flag & 0x04) != 0;  // 第2位表示是否为最后一页
-        uint32_t page_serial = *(uint32_t*)(data + offset + 14);
-        uint32_t page_segments = data[offset + 26];
-
-        // 计算页数据大小
-        size_t segment_table_offset = offset + 27;
-        size_t data_offset = segment_table_offset + page_segments;
-        size_t page_size = 0;
-
-        for (size_t i = 0; i < page_segments; i++) {
-            page_size += data[segment_table_offset + i];
-        }
-
-        // 检查页数据是否完整
-        if (data_offset + page_size > size) {
-            break;
-        }
-
-        // 提取 OPUS 数据并累积
-        std::vector<uint8_t> opus_data(data + data_offset, data + data_offset + page_size);
-        accumulated_opus_data_.insert(accumulated_opus_data_.end(), opus_data.begin(), opus_data.end());
-
-        // 检查是否为最后一页
-        if (is_last_page) {
-            is_file_complete_ = true;
-            // 文件接收完成，发送累积的 OPUS 数据
-            // if (opus_data_callback_) {
-            //     opus_data_callback_(accumulated_opus_data_);
-            // }
-            Process8BitAudio(accumulated_opus_data_.data(), accumulated_opus_data_.size());
-            // 重置状态
-            accumulated_opus_data_.clear();
-            is_receiving_file_ = false;
-            is_file_complete_ = false;
-        } else {
-            // 不是最后一页，继续接收
-            is_receiving_file_ = true;
-        }
-
-        // 移动到下一页
-        offset = data_offset + page_size;
+static bool ParseOpusHead(const uint8_t* data, size_t size, OpusHead& head) {
+    // OpusHead 包以 "OpusHead" 标签开头（8字节）
+    if (size < 19) {
+        return false;
     }
+    
+    // 检查 OpusHead 标签
+    if (memcmp(data, "OpusHead", 8) != 0) {
+        return false;
+    }
+    
+    // 解析 OpusHead 结构（小端序）
+    head.version = data[8];
+    head.channel_count = data[9];
+    head.pre_skip = data[10] | (data[11] << 8);
+    head.sample_rate = data[12] | (data[13] << 8) | (data[14] << 16) | (data[15] << 24);
+    head.output_gain = data[16] | (data[17] << 8);
+    head.mapping_family = data[18];
+    
+    return true;
 }
 
-void WebSocketCodec::Process8BitAudio(const uint8_t* data, size_t size)
-{
-    // 检查数据大小是否为偶数（16位需要2个字节）
-    if (size % 2 != 0) {
-        ESP_LOGW(TAG, "Data size is odd, last byte will be ignored");
-        size = size - 1;  // 忽略最后一个字节
+void WebSocketCodec::ParseOgg(std::vector<std::vector<uint8_t>>& result, const uint8_t* data, size_t size) {
+    const uint8_t* buf = reinterpret_cast<const uint8_t*>(data);
+    size_t offset = 0;
+
+    auto find_page = [&](size_t start)->size_t {
+        for (size_t i = start; i + 4 <= size; ++i) {
+            if (buf[i] == 'O' && buf[i+1] == 'g' && buf[i+2] == 'g' && buf[i+3] == 'S') return i;
+        }
+        return static_cast<size_t>(-1);
+    };
+
+    bool seen_head = false;
+    bool seen_tags = false;
+    int sample_rate = 16000; // 默认值
+
+    int frame_count = 0;
+    while (true) {
+        size_t pos = find_page(offset);
+        if (pos == static_cast<size_t>(-1)) break;
+        offset = pos;
+        if (offset + 27 > size) break;
+
+        const uint8_t* page = buf + offset;
+        uint8_t page_segments = page[26];
+        size_t seg_table_off = offset + 27;
+        if (seg_table_off + page_segments > size) break;
+
+        size_t body_size = 0;
+        for (size_t i = 0; i < page_segments; ++i) body_size += page[27 + i];
+
+        size_t body_off = seg_table_off + page_segments;
+        if (body_off + body_size > size) break;
+
+        // Parse packets using lacing
+        size_t cur = body_off;
+        size_t seg_idx = 0;
+        while (seg_idx < page_segments) {
+            size_t pkt_len = 0;
+            size_t pkt_start = cur;
+            bool continued = false;
+            do {
+                uint8_t l = page[27 + seg_idx++];
+                pkt_len += l;
+                cur += l;
+                continued = (l == 255);
+            } while (continued && seg_idx < page_segments);
+
+            if (pkt_len == 0) continue;
+            const uint8_t* pkt_ptr = buf + pkt_start;
+
+            if (!seen_head) {
+                // 解析OpusHead包
+                if (pkt_len >= 19 && memcmp(pkt_ptr, "OpusHead", 8) == 0) {
+                    seen_head = true;
+                    // OpusHead结构：[0-7] "OpusHead", [8] version, [9] channel_count, [10-11] pre_skip
+                    // [12-15] input_sample_rate, [16-17] output_gain, [18] mapping_family
+                    if (pkt_len >= 12) {
+                        uint8_t version = pkt_ptr[8];
+                        uint8_t channel_count = pkt_ptr[9];
+                        if (pkt_len >= 16) {
+                            // 读取输入采样率 (little-endian)
+                            sample_rate = pkt_ptr[12] | (pkt_ptr[13] << 8) |
+                                        (pkt_ptr[14] << 16) | (pkt_ptr[15] << 24);
+                            ESP_LOGI(TAG, "OpusHead: version=%d, channels=%d, sample_rate=%d",
+                                   version, channel_count, sample_rate);
+                        }
+                    }
+                }
+                continue;
+            }
+            if (!seen_tags) {
+                // Expect OpusTags in second packet
+                if (pkt_len >= 8 && memcmp(pkt_ptr, "OpusTags", 8) == 0) {
+                    seen_tags = true;
+                }
+                continue;
+            }
+
+            frame_count++;
+            if (frame_count == 3) {
+                std::vector<uint8_t> frame;
+                frame.insert(frame.end(), pkt_ptr, pkt_ptr + pkt_len);
+                result.push_back(frame);
+                frame_count = 0;
+            }
+        }
+
+        offset = body_off + body_size;
     }
-    
-    size_t sample_count = size / 2;  // 16位样本数 = 8位字节数 / 2
-    
-    std::lock_guard<std::mutex> lock(buffer_mutex_);
-    for (size_t i = 0; i < sample_count; i++) {
-        // 将2个8位字节组合成1个16位样本
-        // 小端序：低字节在前，高字节在后
-        int16_t pcm_value = static_cast<int16_t>(data[i * 2]) | 
-                           (static_cast<int16_t>(data[i * 2 + 1]) << 8);
-        audio_buffer_.push(pcm_value);
-    }
-    buffer_cv_.notify_one();
-    ESP_LOGI(TAG, "Converted %u bytes to %u 16-bit samples", size, sample_count);
 }
 
 void WebSocketCodec::OutputData(std::vector<int16_t>& data){

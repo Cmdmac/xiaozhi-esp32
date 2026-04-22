@@ -824,18 +824,28 @@ bool AudioService::IsAfeWakeWord() {
 }
 
 //加到发送队列
-void AudioService::PushTaskToSendQueue(const std::vector<uint8_t>& opus) {
+void AudioService::PushTaskToOpenClawSendQueue(const std::vector<uint8_t>& opus) {
     auto packet = std::make_unique<AudioStreamPacket>();
     packet->sample_rate = 16000;//codec_->input_sample_rate();
     packet->frame_duration = 60;
     packet->payload.assign(opus.data(), opus.data() + opus.size());
-    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    audio_send_queue_.push_back(std::move(packet));
-    audio_queue_cv_.notify_one();
+    std::lock_guard<std::mutex> lock(openclaw_audio_queue_mutex_);
+    openclaw_audio_send_queue_.push_back(std::move(packet));
+    openclaw_audio_queue_cv_.notify_all();
+}
+
+//从发送队列取一个包
+std::unique_ptr<AudioStreamPacket> AudioService::PopFromOpenClawSendQueue() {
+    std::unique_lock<std::mutex> lock(openclaw_audio_queue_mutex_);
+    if (openclaw_audio_send_queue_.empty()) {
+        return nullptr;
+    }
+    auto packet = std::move(openclaw_audio_send_queue_.front());
+    openclaw_audio_send_queue_.pop_front();
+    return packet;
 }
 
 void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType, bool isFinish) {
-    ESP_LOGW(TAG, "Received OPUS data: %u", data.size());
     // 创建 AudioStreamPacket
         // 确保 openclaw_wakeup_packet_ 已初始化
     // if (!openclaw_wakeup_packet_) {
@@ -867,6 +877,19 @@ void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioTy
     } else if (audioType == AudioType::OGG) {
         //如果是ogg数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         //mix_codec->writeFromWS(ws_data.data(), ws_data.size());      
-        PushTaskToSendQueue(data);
+        //PushTaskToOpenClawSendQueue(data);
+        bool is_ogg = WebSocketCodec::IsOgg(data.data(), data.size());
+        if (!is_ogg) {
+            ESP_LOGW(TAG, "Not OGG data");
+            return;
+        }
+        if (is_ogg) {
+            std::vector<std::vector<uint8_t>> opus_frames;
+            WebSocketCodec::ParseOgg(opus_frames, data.data(), data.size());
+            ESP_LOGI(TAG, "ParseOgg %d frames", opus_frames.size());
+            for (const auto& frame : opus_frames) {
+                PushTaskToOpenClawSendQueue(frame);
+            }
+        }
     }
 }

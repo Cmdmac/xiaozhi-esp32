@@ -40,10 +40,8 @@ public:
     virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
 
-    bool IsOggContainer(const uint8_t* data, size_t size);
-    void ParseOggContainer(const uint8_t* data, size_t size);
-    void Process8BitAudio(const uint8_t* data, size_t size);
-
+    static bool IsOgg(const uint8_t* data, size_t size);
+    static void ParseOgg(std::vector<std::vector<uint8_t>>& result, const uint8_t* data, size_t size);
 
 };
 

@@ -134,7 +134,8 @@ public:
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
 
-    void PushTaskToSendQueue(const std::vector<uint8_t>& opus);
+    void PushTaskToOpenClawSendQueue(const std::vector<uint8_t>& opus);
+    std::unique_ptr<AudioStreamPacket> PopFromOpenClawSendQueue();
     void ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioType audioType, bool isFinish);
 
 private:
@@ -171,6 +172,10 @@ private:
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
+
+    std::mutex openclaw_audio_queue_mutex_;
+    std::condition_variable openclaw_audio_queue_cv_;
+    std::deque<std::unique_ptr<AudioStreamPacket>> openclaw_audio_send_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;

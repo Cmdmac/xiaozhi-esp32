@@ -629,9 +629,13 @@ void Application::InitializeProtocol() {
     openclaw_websocket_->SetAudioDataCallback([this](const std::vector<uint8_t>& data, AudioType audioType, bool isFinish) {
         audio_service_.ReceiveFromOpenClaw(data, audioType, isFinish);
         if (isFinish) {
-            ESP_LOGI(TAG, "WakeUpFromOpenClaw Received finish signal");
-            xEventGroupSetBits(event_group_, MAIN_EVENT_SEND_AUDIO);
-            WakeUpFromOpenClaw();           
+            // 禁用本地音频输入
+            auto audio_codec = WifiBoard::GetInstance().GetAudioCodec();
+            // audio_codec->EnableInput(false);
+            while(auto packet = audio_service_.PopFromOpenClawSendQueue()){
+                protocol_->SendAudio(std::move(packet));
+            }
+            WakeUpFromOpenClaw();         
         }
     });
 
@@ -1059,40 +1063,40 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
 }
 
 void Application::WakeUpFromOpenClaw() {
-    
+
     if (!protocol_) {
         ESP_LOGE(TAG, "Protocol not initialized");
         return;
     }
 
-    // auto state = GetDeviceState();
-    // ESP_LOGW(TAG, "Current device state: %d", state);
-    // if (state == kDeviceStateIdle) {
-    //     if (!protocol_->IsAudioChannelOpened()) {
-    //         SetDeviceState(kDeviceStateConnecting);
-    //         if (!protocol_->OpenAudioChannel()) {
-    //             ESP_LOGE(TAG, "Failed to open audio channel");
-    //             return;
-    //         }
-    //     }        
-    //     ESP_LOGW(TAG, "Audio channel opened SetListeningMode");
-    //     SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
-    // } else if (state == kDeviceStateSpeaking) {
-    //     AbortSpeaking(kAbortReasonNone);
-    // } else if (state == kDeviceStateActivating) {
-    //     // 与语音唤醒流程保持一致
-    //     SetDeviceState(kDeviceStateIdle);
-    // } else if (state == kDeviceStateListening) {
-    //     if (!protocol_->IsAudioChannelOpened()) {
-    //         SetDeviceState(kDeviceStateConnecting);
-    //         if (!protocol_->OpenAudioChannel()) {
-    //             ESP_LOGE(TAG, "Failed to open audio channel");
-    //             return;
-    //         }
-    //     }        
-    //     // onGetOpenClawWebMsg(openclaw_wakeup_packet_);
-    //     // openclaw_wakeup_packet_.reset();
-    // }
+    auto state = GetDeviceState();
+    ESP_LOGW(TAG, "Current device state: %d", state);
+    if (state == kDeviceStateIdle) {
+        if (!protocol_->IsAudioChannelOpened()) {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                ESP_LOGE(TAG, "Failed to open audio channel");
+                return;
+            }
+        }        
+        ESP_LOGW(TAG, "Audio channel opened SetListeningMode");
+        SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
+    } else if (state == kDeviceStateSpeaking) {
+        AbortSpeaking(kAbortReasonNone);
+    } else if (state == kDeviceStateActivating) {
+        // 与语音唤醒流程保持一致
+        SetDeviceState(kDeviceStateIdle);
+    } else if (state == kDeviceStateListening) {
+        if (!protocol_->IsAudioChannelOpened()) {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                ESP_LOGE(TAG, "Failed to open audio channel");
+                return;
+            }
+        }        
+        // onGetOpenClawWebMsg(openclaw_wakeup_packet_);
+        // openclaw_wakeup_packet_.reset();
+    }
 }
 
 void Application::onGetOpenClawWebMsg(std::unique_ptr<AudioStreamPacket> &packet) {
