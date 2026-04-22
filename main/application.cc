@@ -900,6 +900,11 @@ void Application::HandleStateChangedEvent() {
                 }
                 audio_service_.EnableVoiceProcessing(true);
                 audio_service_.EnableWakeWordDetection(false);
+            } else {
+                //正在处理音频，立即发送来自MCP Server的音频
+                while(auto packet = audio_service_.PopFromOpenClawSendQueue()){
+                    protocol_->SendAudio(std::move(packet));
+                }
             }
 
             // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
