@@ -45,4 +45,38 @@ public:
 
 };
 
+struct OpusHead {
+    uint8_t version;           // 版本号
+    uint8_t channel_count;     // 通道数
+    uint16_t pre_skip;         // 预跳过样本数
+    uint32_t sample_rate;      // 输入采样率
+    int16_t output_gain;       // 输出增益
+    uint8_t mapping_family;    // 通道映射族
+};
+
+// ogg_parser.h
+class OggParser {
+public:
+    
+    OggParser();
+    
+    std::vector<std::vector<uint8_t>> Parse(const uint8_t* data, size_t size);
+    bool GetOpusHead(OpusHead& head) const;
+    int GetSampleRate() const { return sample_rate_; }
+    
+private:
+    bool IsOgg(const uint8_t* data, size_t size);  
+    bool ParseOpusHead(const uint8_t* data, size_t size);
+    size_t FindPage(const uint8_t* data, size_t size, size_t start);
+    bool ParsePage(const uint8_t* page, size_t page_size,
+                   std::vector<std::vector<uint8_t>>& result);
+    
+    OpusHead opus_head_;
+    int sample_rate_;
+    // bool seen_head_;
+    // bool seen_tags_;
+    int frame_count_;
+    static const char* TAG;
+};
+
 #endif // __WEBSOCKET_CODEC_H__

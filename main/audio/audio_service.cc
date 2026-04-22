@@ -878,18 +878,11 @@ void AudioService::ReceiveFromOpenClaw(const std::vector<uint8_t>& data, AudioTy
         //如果是ogg数据，写入MixAudioCodec的OpenClawCodec在Read的时候读出来
         //mix_codec->writeFromWS(ws_data.data(), ws_data.size());      
         //PushTaskToOpenClawSendQueue(data);
-        bool is_ogg = WebSocketCodec::IsOgg(data.data(), data.size());
-        if (!is_ogg) {
-            ESP_LOGW(TAG, "Not OGG data");
-            return;
-        }
-        if (is_ogg) {
-            std::vector<std::vector<uint8_t>> opus_frames;
-            WebSocketCodec::ParseOgg(opus_frames, data.data(), data.size());
-            ESP_LOGI(TAG, "ParseOgg %d frames", opus_frames.size());
-            for (const auto& frame : opus_frames) {
-                PushTaskToOpenClawSendQueue(frame);
-            }
+        OggParser parser;
+        std::vector<std::vector<uint8_t>> opus_frames = parser.Parse(data.data(), data.size());
+        ESP_LOGI(TAG, "ParseOgg %d frames", opus_frames.size());
+        for (const auto& frame : opus_frames) {
+            PushTaskToOpenClawSendQueue(frame);
         }
     }
 }

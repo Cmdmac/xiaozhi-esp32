@@ -3,8 +3,12 @@
 #include "esp_log.h"
 
 const char* WebSocketCodec::TAG = "WebSocketCodec";
+const char* OggParser::TAG = "OggParser";
 
-bool WebSocketCodec::IsOgg(const uint8_t* data, size_t size) {
+OggParser::OggParser() : frame_count_(0) {
+}
+        
+bool OggParser::IsOgg(const uint8_t* data, size_t size) {
     return size >= 4 && 
            data[0] == 'O' && 
            data[1] == 'g' && 
@@ -12,16 +16,7 @@ bool WebSocketCodec::IsOgg(const uint8_t* data, size_t size) {
            data[3] == 'S';
 }
 
-struct OpusHead {
-    uint8_t version;           // 版本号
-    uint8_t channel_count;     // 通道数
-    uint16_t pre_skip;         // 预跳过样本数
-    uint32_t sample_rate;      // 输入采样率
-    int16_t output_gain;       // 输出增益
-    uint8_t mapping_family;    // 通道映射族
-};
-
-static bool ParseOpusHead(const uint8_t* data, size_t size, OpusHead& head) {
+bool OggParser::ParseOpusHead(const uint8_t* data, size_t size) {
     // OpusHead 包以 "OpusHead" 标签开头（8字节）
     if (size < 19) {
         return false;
@@ -33,17 +28,23 @@ static bool ParseOpusHead(const uint8_t* data, size_t size, OpusHead& head) {
     }
     
     // 解析 OpusHead 结构（小端序）
-    head.version = data[8];
-    head.channel_count = data[9];
-    head.pre_skip = data[10] | (data[11] << 8);
-    head.sample_rate = data[12] | (data[13] << 8) | (data[14] << 16) | (data[15] << 24);
-    head.output_gain = data[16] | (data[17] << 8);
-    head.mapping_family = data[18];
+    opus_head_.version = data[8];
+    opus_head_.channel_count = data[9];
+    opus_head_.pre_skip = data[10] | (data[11] << 8);
+    opus_head_.sample_rate = data[12] | (data[13] << 8) | (data[14] << 16) | (data[15] << 24);
+    opus_head_.output_gain = data[16] | (data[17] << 8);
+    opus_head_.mapping_family = data[18];
     
     return true;
 }
 
-void WebSocketCodec::ParseOgg(std::vector<std::vector<uint8_t>>& result, const uint8_t* data, size_t size) {
+std::vector<std::vector<uint8_t>>  OggParser::Parse(const uint8_t* data, size_t size) {
+
+    std::vector<std::vector<uint8_t>> result;
+    if (!IsOgg(data, size)) {
+        ESP_LOGW(TAG, "Not OGG data");
+        return result;
+    }
     const uint8_t* buf = reinterpret_cast<const uint8_t*>(data);
     size_t offset = 0;
 
@@ -56,7 +57,7 @@ void WebSocketCodec::ParseOgg(std::vector<std::vector<uint8_t>>& result, const u
 
     bool seen_head = false;
     bool seen_tags = false;
-    int sample_rate = 16000; // 默认值
+    sample_rate_ = 16000; // 默认值
 
     int frame_count = 0;
     while (true) {
@@ -104,10 +105,10 @@ void WebSocketCodec::ParseOgg(std::vector<std::vector<uint8_t>>& result, const u
                         uint8_t channel_count = pkt_ptr[9];
                         if (pkt_len >= 16) {
                             // 读取输入采样率 (little-endian)
-                            sample_rate = pkt_ptr[12] | (pkt_ptr[13] << 8) |
+                            sample_rate_ = pkt_ptr[12] | (pkt_ptr[13] << 8) |
                                         (pkt_ptr[14] << 16) | (pkt_ptr[15] << 24);
                             ESP_LOGI(TAG, "OpusHead: version=%d, channels=%d, sample_rate=%d",
-                                   version, channel_count, sample_rate);
+                                   version, channel_count, sample_rate_);
                         }
                     }
                 }
@@ -120,8 +121,9 @@ void WebSocketCodec::ParseOgg(std::vector<std::vector<uint8_t>>& result, const u
                 }
                 continue;
             }
-
+            frame_count_++;
             frame_count++;
+            // 60ms 一帧
             if (frame_count == 3) {
                 std::vector<uint8_t> frame;
                 frame.insert(frame.end(), pkt_ptr, pkt_ptr + pkt_len);
@@ -132,6 +134,7 @@ void WebSocketCodec::ParseOgg(std::vector<std::vector<uint8_t>>& result, const u
 
         offset = body_off + body_size;
     }
+    return result;
 }
 
 void WebSocketCodec::OutputData(std::vector<int16_t>& data){

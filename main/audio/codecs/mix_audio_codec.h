@@ -1,4 +1,6 @@
-#pragma once
+#ifndef MIX_AUDIO_CODEC_CC
+#define MIX_AUDIO_CODEC_CC
+
 #include "audio_codec.h"
 #include "websocket_codec.h"
 #include "codecs/no_audio_codec.h"
@@ -27,3 +29,6 @@ class MixAudioCodec : public AudioCodec {
         virtual int Read(int16_t* dest, int samples) override;
         virtual int Write(const int16_t* data, int samples) override;
 };
+
+
+#endif
