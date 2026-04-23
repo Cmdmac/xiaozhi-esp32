@@ -67,14 +67,19 @@ public:
 private:
     bool IsOgg(const uint8_t* data, size_t size);  
     bool ParseOpusHead(const uint8_t* data, size_t size);
-    size_t FindPage(const uint8_t* data, size_t size, size_t start);
-    bool ParsePage(const uint8_t* page, size_t page_size,
-                   std::vector<std::vector<uint8_t>>& result);
+    // 寻找下一个 OGG 页头
+    bool FindNextPage(const uint8_t* data, size_t size, size_t& offset);
+    
+    // 处理单个切分好的 Opus 数据包
+    void ProcessOpusPacket(const uint8_t* pkt, size_t pkt_len, 
+                           std::vector<std::vector<uint8_t>>& result,
+                           std::vector<uint8_t>& frame_buffer, 
+                           int& local_frame_count);
     
     OpusHead opus_head_;
     int sample_rate_;
-    // bool seen_head_;
-    // bool seen_tags_;
+    bool seen_head_;
+    bool seen_tags_;
     int frame_count_;
     static const char* TAG;
 };
