@@ -700,7 +700,10 @@ void AudioService::CheckAndUpdateAudioPowerState() {
         ESP_LOGW(TAG, "Output power timeout, disable output");
         // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
         if (!(codec_->duplex() && codec_->input_enabled())) {
+            // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
+        if (!(codec_->duplex() && codec_->input_enabled())) {
             codec_->EnableOutput(false);
+        }
         }
     }
     if (!codec_->input_enabled() && !codec_->output_enabled()) {
