@@ -838,15 +838,8 @@ void Application::HandleWakeWordDetectedEvent() {
     }
 }
 
-void Application::HandleStateChangedEvent() {
-    DeviceState new_state = state_machine_.GetState();
-    clock_ticks_ = 0;
-
+void Application::HandlerScreenSaver(DeviceState new_state) {
     auto& board = Board::GetInstance();
-    auto display = board.GetDisplay();
-    auto led = board.GetLed();
-    led->OnStateChanged();
-
     // Handle screen brightness based on state
     auto backlight = board.GetBacklight();
     if (backlight != nullptr) {
@@ -873,6 +866,19 @@ void Application::HandleStateChangedEvent() {
                 break;
         }
     }
+}   
+
+void Application::HandleStateChangedEvent() {
+    DeviceState new_state = state_machine_.GetState();
+    clock_ticks_ = 0;
+
+    auto& board = Board::GetInstance();
+    auto display = board.GetDisplay();
+    auto led = board.GetLed();
+    led->OnStateChanged();
+
+    // handler screen saver
+    HandlerScreenSaver();
     ESP_LOGW(TAG, "State changed to %d", new_state);
     switch (new_state) {
         case kDeviceStateUnknown:
@@ -881,6 +887,13 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral");
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+
+            ESP_LOGI(TAG, "check openclaw response when state is idle");
+            //正在处理音频，立即发送来自MCP Server的音频
+            while(auto packet = audio_service_.PopFromOpenClawSendQueue()){
+                protocol_->SendAudio(std::move(packet));
+            }
+                
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -908,7 +921,13 @@ void Application::HandleStateChangedEvent() {
                 }
                 audio_service_.EnableVoiceProcessing(true);
                 audio_service_.EnableWakeWordDetection(false);
-            } 
+            } else {
+                ESP_LOGI(TAG, "check openclaw response when state is Listening");
+                //正在处理音频，立即发送来自MCP Server的音频
+                while(auto packet = audio_service_.PopFromOpenClawSendQueue()){
+                    protocol_->SendAudio(std::move(packet));
+                }
+            }
 
             // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
             if (play_popup_on_listening_) {
@@ -1088,7 +1107,7 @@ void Application::WakeUpFromOpenClaw() {
         ESP_LOGW(TAG, "Audio channel opened SetListeningMode");
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
     } else if (state == kDeviceStateSpeaking) {
-        AbortSpeaking(kAbortReasonNone);
+        //AbortSpeaking(kAbortReasonNone);
     } else if (state == kDeviceStateActivating) {
         // 与语音唤醒流程保持一致
         SetDeviceState(kDeviceStateIdle);

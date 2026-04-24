@@ -162,7 +162,7 @@ private:
     void DimScreen();
     void TurnOffScreen();
     void RestoreScreenBrightness();
-
+    void HandlerScreenSaver(DeviceState);
 
     // Event handlers
     void HandleStateChangedEvent();
