@@ -24,6 +24,7 @@
 #include "wake_word.h"
 #include "protocol.h"
 #include "openclaw_websocket.h"
+#include "ogg_demuxer.h"
 
 /*
  * There are two types of audio data flow:
