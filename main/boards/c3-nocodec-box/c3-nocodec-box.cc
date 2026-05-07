@@ -26,6 +26,7 @@
 #include "system_reset.h"
 #include "alarm_manager.h"
 #include "sdkconfig.h"
+#include "codecs/mix_audio_codec.h"
 
 #ifdef CONFIG_ESP_HI_WEB_CONTROL_ENABLED
 #include "esp_hi_web_control.h"
@@ -54,22 +55,6 @@ static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
     {0x2C, NULL, 0, 0},     // Memory write
 };
 
-static const led_strip_config_t bsp_strip_config = {
-    .strip_gpio_num = GPIO_NUM_8,
-    .max_leds = 4,
-    .led_model = LED_MODEL_WS2812,
-    .flags = {
-        .invert_out = false
-    }
-};
-
-static const led_strip_rmt_config_t bsp_rmt_config = {
-    .clk_src = RMT_CLK_SRC_DEFAULT,
-    .resolution_hz = 10 * 1000 * 1000,
-    .flags = {
-        .with_dma = false
-    }
-};
 
 class C3NoCodecBox : public WifiBoard {
 private:
@@ -78,8 +63,7 @@ private:
     Button move_wake_button_;
     anim::EmojiWidget* display_ = nullptr;
     bool web_server_initialized_ = false;
-    led_strip_handle_t led_strip_;
-    bool led_on_ = false;
+    MixAudioCodec* mix_audio_codec_ = nullptr;
 
     void InitializeButtons() {
         static int64_t last_trigger_time = 0;
@@ -97,14 +81,7 @@ private:
     }
     
     void InitializeLed() {
-        ESP_LOGI(TAG, "BLINK_GPIO setting %d", bsp_strip_config.strip_gpio_num);
 
-        ESP_ERROR_CHECK(led_strip_new_rmt_device(&bsp_strip_config, &bsp_rmt_config, &led_strip_));
-        led_strip_set_pixel(led_strip_, 0, 0x00, 0x00, 0x00);
-        led_strip_set_pixel(led_strip_, 1, 0x00, 0x00, 0x00);
-        led_strip_set_pixel(led_strip_, 2, 0x00, 0x00, 0x00);
-        led_strip_set_pixel(led_strip_, 3, 0x00, 0x00, 0x00);
-        led_strip_refresh(led_strip_);
     }
 
 
@@ -284,14 +261,17 @@ public:
 
     virtual AudioCodec* GetAudioCodec() override
     {
-        static AdcPdmAudioCodec audio_codec(
-            AUDIO_INPUT_SAMPLE_RATE,
-            AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_ADC_MIC_CHANNEL,
-            AUDIO_PDM_SPEAK_P_GPIO, 
-            AUDIO_PDM_SPEAK_N_GPIO,
-            AUDIO_PA_CTL_GPIO);
-        return &audio_codec;
+        if (mix_audio_codec_ == nullptr) {
+            static AdcPdmAudioCodec audio_codec(
+                AUDIO_INPUT_SAMPLE_RATE,
+                AUDIO_OUTPUT_SAMPLE_RATE,
+                AUDIO_ADC_MIC_CHANNEL,
+                AUDIO_PDM_SPEAK_P_GPIO, 
+                AUDIO_PDM_SPEAK_N_GPIO,
+                AUDIO_PA_CTL_GPIO);
+            mix_audio_codec_ = new MixAudioCodec(&audio_codec);
+        }
+        return mix_audio_codec_;
     }
 
     virtual Display* GetDisplay() override

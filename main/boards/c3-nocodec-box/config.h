@@ -9,10 +9,10 @@
 // 配置PDM上采样fs参数（取值范围<=480）。部分设备在441时表现更稳定
 #define AUDIO_PDM_UPSAMPLE_FS    441                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
  
-#define AUDIO_ADC_MIC_CHANNEL       4
-#define AUDIO_PDM_SPEAK_P_GPIO      GPIO_NUM_3
-#define AUDIO_PDM_SPEAK_N_GPIO      GPIO_NUM_5
-#define AUDIO_PA_CTL_GPIO           GPIO_NUM_4
+#define AUDIO_ADC_MIC_CHANNEL       ADC_CHANNEL_1
+#define AUDIO_PDM_SPEAK_P_GPIO      GPIO_NUM_4
+#define AUDIO_PDM_SPEAK_N_GPIO      GPIO_NUM_0
+#define AUDIO_PA_CTL_GPIO           GPIO_NUM_5
 
 #define BUILTIN_LED_GPIO            GPIO_NUM_NC
 #define BOOT_BUTTON_GPIO            GPIO_NUM_9
@@ -22,8 +22,8 @@
 #define DISPLAY_MOSI_PIN            GPIO_NUM_7
 #define DISPLAY_CLK_PIN             GPIO_NUM_8
 #define DISPLAY_DC_PIN              GPIO_NUM_6
-#define DISPLAY_RST_PIN             GPIO_NUM_2
-#define DISPLAY_CS_PIN              GPIO_NUM_10
+#define DISPLAY_RST_PIN             GPIO_NUM_NC
+#define DISPLAY_CS_PIN              GPIO_NUM_NC
 
 // #define RESET_NVS_BUTTON_GPIO        GPIO_NUM_12
 

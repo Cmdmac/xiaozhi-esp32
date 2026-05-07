@@ -5,7 +5,6 @@
 #include <driver/i2c.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
-#include "adc_mic.h"
 #include "driver/i2s_pdm.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/io_mux_reg.h"
@@ -44,18 +43,19 @@ AdcPdmAudioCodec::AdcPdmAudioCodec(int input_sample_rate, int output_sample_rate
     input_sample_rate_ = input_sample_rate;
     output_sample_rate_ = output_sample_rate;
 
-    uint8_t adc_channel[1] = {0};
-    adc_channel[0] = adc_mic_channel;
-
-    audio_codec_adc_cfg_t cfg = {
-        .handle = NULL,
-        .max_store_buf_size = 1024 * 2,
-        .conv_frame_size = 1024,
-        .unit_id = ADC_UNIT_1,
-        .adc_channel_list = adc_channel,
-        .adc_channel_num = sizeof(adc_channel) / sizeof(adc_channel[0]),
-        .sample_rate_hz = (uint32_t)input_sample_rate,
-    };
+    audio_codec_adc_cfg_t cfg = {};
+    cfg.handle = NULL;
+    cfg.continuous_cfg.max_store_buf_size = 1024 * 2;
+    cfg.continuous_cfg.conv_frame_size = 1024;
+    cfg.continuous_cfg.sample_freq_hz = (uint32_t)input_sample_rate;
+    cfg.continuous_cfg.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+    cfg.continuous_cfg.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+    cfg.continuous_cfg.pattern_num = 1;
+    cfg.continuous_cfg.cfg_mode = AUDIO_CODEC_ADC_CFG_MODE_SINGLE_UNIT;
+    cfg.continuous_cfg.cfg.single_unit.unit_id = ADC_UNIT_1;
+    cfg.continuous_cfg.cfg.single_unit.atten = ADC_ATTEN_DB_12;
+    cfg.continuous_cfg.cfg.single_unit.bit_width = ADC_BITWIDTH_12;
+    cfg.continuous_cfg.cfg.single_unit.channel_id[0] = (uint8_t)adc_mic_channel;
     const audio_codec_data_if_t *adc_if = audio_codec_new_adc_data(&cfg);
 
     esp_codec_dev_cfg_t codec_dev_cfg = {
@@ -81,6 +81,7 @@ AdcPdmAudioCodec::AdcPdmAudioCodec(int input_sample_rate, int output_sample_rate
     const i2s_pdm_tx_config_t *p_i2s_cfg = &pdm_cfg_default;
 
     ESP_ERROR_CHECK(i2s_channel_init_pdm_tx_mode(tx_handle_, p_i2s_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle_));
 
     audio_codec_i2s_cfg_t i2s_cfg = {
         .port = I2S_NUM_0,
@@ -94,6 +95,11 @@ AdcPdmAudioCodec::AdcPdmAudioCodec(int input_sample_rate, int output_sample_rate
     codec_dev_cfg.codec_if = NULL;
     codec_dev_cfg.data_if = i2s_data_if;
     output_dev_ = esp_codec_dev_new(&codec_dev_cfg);
+    if (!output_dev_) {
+        ESP_LOGE(TAG, "Failed to create output codec device");
+        return;
+    }
+    ESP_LOGI(TAG, "Output codec device created successfully");
 
     output_volume_ = 100;
     if(pa_ctl != GPIO_NUM_NC) {
@@ -147,11 +153,9 @@ void AdcPdmAudioCodec::SetOutputVolume(int volume) {
 }
 
 void AdcPdmAudioCodec::EnableInput(bool enable) {
-    ESP_LOGW(TAG, "EnableInput");
     if (enable == input_enabled_) {
         return;
     }
-    ESP_LOGW(TAG, "Set input enable to %s", enable ? "true" : "false");
     if (enable) {
         esp_codec_dev_sample_info_t fs = {
             .bits_per_sample = 16,
@@ -160,10 +164,18 @@ void AdcPdmAudioCodec::EnableInput(bool enable) {
             .sample_rate = (uint32_t)input_sample_rate_,
             .mclk_multiple = 0,
         };
-        ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
+        esp_err_t err = esp_codec_dev_open(input_dev_, &fs);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_codec_dev_open failed: %s", esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "Input enabled");
     } else {
-        ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
+        // ESP32-C3 ADC 连续模式在 esp_codec_dev_close 时有 bug
+        // 暂时不关闭，只是标记状态
+        ESP_LOGW(TAG, "EnableInput(false) skipped due to ESP32-C3 ADC bug");
     }
+    // 调用基类方法更新状态
     AudioCodec::EnableInput(enable);
 }
 
@@ -171,6 +183,7 @@ void AdcPdmAudioCodec::EnableOutput(bool enable) {
     if (enable == output_enabled_) {
         return;
     }
+    ESP_LOGI(TAG, "EnableOutput %d", enable);
     if (enable) {
         // Play 16bit 1 channel
         esp_codec_dev_sample_info_t fs = {
@@ -194,9 +207,9 @@ void AdcPdmAudioCodec::EnableOutput(bool enable) {
             gpio_set_level(pa_ctrl_pin_, 1);
         }
         // 启用输出时启动定时器
-        if (output_timer_) {
-            esp_timer_start_once(output_timer_, TIMER_TIMEOUT_US);
-        }
+        // if (output_timer_) {
+        //     esp_timer_start_once(output_timer_, TIMER_TIMEOUT_US);
+        // }
 
     } else {
         // 禁用输出时停止定时器
@@ -212,35 +225,41 @@ void AdcPdmAudioCodec::EnableOutput(bool enable) {
 }
 
 int AdcPdmAudioCodec::Read(int16_t* dest, int samples) {
-    if (input_enabled_) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
+    int read_samples = 0;
+    if (input_enabled_ && input_dev_) {
+        esp_err_t err = esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t));
+        if (err == ESP_OK) {
+            read_samples = samples;
+        } else {
+            ESP_LOGE(TAG, "esp_codec_dev_read failed: %s", esp_err_to_name(err));
+            read_samples = 0;
+        }
+    } else {
+        if (!input_dev_) {
+            ESP_LOGE(TAG, "input_dev_ is NULL");
+        }
+        if (!input_enabled_) {
+            ESP_LOGE(TAG, "input not enabled");
+        }
+        // 输入未启用，填充0
+        memset(dest, 0, samples * sizeof(int16_t));
+        read_samples = samples;
     }
-
-    // 添加日志：检查读取的数据
-    int16_t min_val = INT16_MAX;
-    int16_t max_val = INT16_MIN;
-    int non_zero_count = 0;
     
-    for (int i = 0; i < samples; i++) {
-        if (dest[i] < min_val) min_val = dest[i];
-        if (dest[i] > max_val) max_val = dest[i];
-        if (dest[i] != 0) non_zero_count++;
-    }
-    
-    ESP_LOGI(TAG, "Audio data: samples=%d, min=%d, max=%d, non_zero=%d", 
-              samples, min_val, max_val, non_zero_count);
-
-    return samples;
+    return read_samples;
 }
 int AdcPdmAudioCodec::Write(const int16_t* data, int samples) {
     if (output_enabled_) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(output_dev_, (void*)data, samples * sizeof(int16_t)));
         // 重置输出定时器
-        if (output_timer_) {
-            esp_timer_stop(output_timer_);
-            esp_timer_start_once(output_timer_, TIMER_TIMEOUT_US);
-        }
+        // if (output_timer_) {
+        //     esp_timer_stop(output_timer_);
+        //     esp_timer_start_once(output_timer_, TIMER_TIMEOUT_US);
+        // }
+    } else {
+        ESP_LOGW(TAG, "Write: output not enabled");
     }
+    
     return samples;
 }
 
