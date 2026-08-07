@@ -10,6 +10,8 @@
 #include "alarm_manager.h"
 #include "codecs/mix_audio_codec.h"
 
+#include "nvs_flash.h"
+
 // ===== IR 遥控伴侣模块 (纯学习模式) =====
 #include <remote_transmitter.h>
 #include <IRLearner.h>
@@ -23,6 +25,10 @@
 #endif //CONFIG_ESP_HI_WEB_CONTROL_ENABLED
 
 #define TAG "WIFI-REMOTE-COMPANION"
+
+// 学习结果 NVS 持久化
+#define IR_NVS_NAMESPACE "ir_keys"
+#define IR_NVS_KEY       "learned"
 
 using heatpump_ir_tx::RemoteTransmitter;
 using heatpump_ir_tx::RemoteTransmitData;
@@ -41,11 +47,148 @@ private:
 
     static void IRLoopTask(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
+        uint32_t idle_ticks = 0;
+        bool was_learning = false;
         while (true) {
             if (self->ir_learner_) {
                 self->ir_learner_->loop();
             }
+            // 学习会话刚结束(isLearning true->false) → 自动保存学习结果到 NVS
+            bool learning = self->ir_learner_ ? self->ir_learner_->isLearning() : false;
+            if (was_learning && !learning) {
+                self->SaveIRKeysToNVS();
+            }
+            was_learning = learning;
+
+            // 无学习/回放任务时, 空闲约 1 秒(50*20ms)后自挂起, 由 EnsureIRLoopTask 唤醒,
+            // 避免一直空转; 挂起前留 1 秒余量以消除与 MCP 回调(启动学习)之间的竞态
+            if (self->ir_learner_ && !learning) {
+                if (++idle_ticks >= 50) {
+                    idle_ticks = 0;
+                    vTaskSuspend(nullptr);
+                }
+            } else {
+                idle_ticks = 0;
+            }
             vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+
+    // 按需创建/唤醒 ir_loop 任务 (开始学习或回放前调用)
+    void EnsureIRLoopTask() {
+        if (ir_task_ == nullptr) {
+            xTaskCreate(IRLoopTask, "ir_loop", 6144, this, 1, &ir_task_);
+        } else {
+            vTaskResume(ir_task_);
+        }
+    }
+
+    // ===== 学习结果 NVS 持久化 =====
+    static void PutU16(std::vector<uint8_t>& buf, size_t& off, uint16_t v) {
+        buf[off++] = static_cast<uint8_t>(v & 0xFF);
+        buf[off++] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    }
+
+    static uint16_t GetU16(const std::vector<uint8_t>& buf, size_t& off) {
+        uint16_t v = static_cast<uint16_t>(buf[off]) |
+                     (static_cast<uint16_t>(buf[off + 1]) << 8);
+        off += 2;
+        return v;
+    }
+
+    // 将已学习按键(仅 isLearned 且有原始码)序列化到 NVS
+    void SaveIRKeysToNVS() {
+        if (ir_learner_ == nullptr) return;
+        auto& keys = ir_learner_->getKeys();
+        uint16_t count = 0;
+        for (auto& k : keys) {
+            if (k.isLearned && !k.rawData.empty()) count++;
+        }
+        nvs_handle_t h;
+        if (nvs_open(IR_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
+            ESP_LOGE(TAG, "nvs_open(%s) failed", IR_NVS_NAMESPACE);
+            return;
+        }
+        if (count == 0) {
+            nvs_erase_key(h, IR_NVS_KEY);  // 无已学习按键 → 清空
+            nvs_commit(h);
+            nvs_close(h);
+            ESP_LOGI(TAG, "无已学习按键, 已清空 NVS");
+            return;
+        }
+        // 布局: [count u16] 每键: [name_len u16][name][raw_count u16][raw u16...][freq u16]
+        size_t total = 2;
+        for (auto& k : keys) {
+            if (!k.isLearned || k.rawData.empty()) continue;
+            total += 2 + k.name.size() + 2 + k.rawData.size() * 2 + 2;
+        }
+        std::vector<uint8_t> buf(total);
+        size_t off = 0;
+        PutU16(buf, off, count);
+        for (auto& k : keys) {
+            if (!k.isLearned || k.rawData.empty()) continue;
+            PutU16(buf, off, static_cast<uint16_t>(k.name.size()));
+            memcpy(buf.data() + off, k.name.data(), k.name.size());
+            off += k.name.size();
+            PutU16(buf, off, static_cast<uint16_t>(k.rawData.size()));
+            for (auto v : k.rawData) PutU16(buf, off, v);
+            PutU16(buf, off, k.frequency);
+        }
+        esp_err_t err = nvs_set_blob(h, IR_NVS_KEY, buf.data(), total);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "保存按键到 NVS 失败: %s", esp_err_to_name(err));
+            return;
+        }
+        ESP_LOGI(TAG, "已保存 %d 个按键到 NVS (%d bytes)", count, (int)total);
+    }
+
+    // 开机从 NVS 恢复上次学习结果
+    void LoadIRKeysFromNVS() {
+        if (ir_learner_ == nullptr) return;
+        nvs_handle_t h;
+        if (nvs_open(IR_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+            return;  // 从未保存过
+        }
+        size_t len = 0;
+        if (nvs_get_blob(h, IR_NVS_KEY, nullptr, &len) != ESP_OK || len < 2) {
+            nvs_close(h);
+            return;
+        }
+        std::vector<uint8_t> buf(len);
+        if (nvs_get_blob(h, IR_NVS_KEY, buf.data(), &len) != ESP_OK) {
+            nvs_close(h);
+            return;
+        }
+        nvs_close(h);
+
+        size_t off = 0;
+        uint16_t count = GetU16(buf, off);
+        uint16_t loaded = 0;
+        for (uint16_t i = 0; i < count && off + 2 <= len; i++) {
+            uint16_t name_len = GetU16(buf, off);
+            if (off + name_len > len) break;
+            std::string name(reinterpret_cast<const char*>(buf.data() + off), name_len);
+            off += name_len;
+            if (off + 2 > len) break;
+            uint16_t raw_count = GetU16(buf, off);
+            if (off + static_cast<size_t>(raw_count) * 2 > len) break;
+            std::vector<uint16_t> raw(raw_count);
+            for (uint16_t j = 0; j < raw_count; j++) raw[j] = GetU16(buf, off);
+            if (off + 2 > len) break;
+            uint16_t freq = GetU16(buf, off);
+
+            IRRawKey k;
+            k.name = name;
+            k.rawData = raw;
+            k.frequency = freq;
+            k.isLearned = true;
+            ir_learner_->getKeys().push_back(k);
+            loaded++;
+        }
+        if (loaded > 0) {
+            ESP_LOGI(TAG, "已从 NVS 恢复 %d 个按键", loaded);
         }
     }
 
@@ -75,19 +218,21 @@ private:
         ir_learner_->setup();
         ir_learner_->setIRSender(new IRSenderRMT(&ir_tx_));
 
+        // 开机从 NVS 恢复上次学习结果 (学习完成后由 ir_loop 任务自动保存)
+        LoadIRKeysFromNVS();
+
         // 开机预置默认学习按键(空调), 保证按键列表始终已初始化;
         // 之后可通过 self.ir.learn_start 的 preset/keys 参数覆盖
-        ir_learner_->addTargetKey("电源");
-        ir_learner_->addTargetKey("模式");
-        ir_learner_->addTargetKey("温度+");
-        ir_learner_->addTargetKey("温度-");
-        ir_learner_->addTargetKey("风速");
-        ir_learner_->addTargetKey("上下扫风");
-        ir_learner_->addTargetKey("左右扫风");
-        ir_learner_->addTargetKey("定时");
-        ESP_LOGI(TAG, "预置学习按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时");
-
-        xTaskCreate(IRLoopTask, "ir_loop", 6144, this, 1, &ir_task_);
+        // ir_learner_->addTargetKey("电源");
+        // ir_learner_->addTargetKey("模式");
+        // ir_learner_->addTargetKey("温度+");
+        // ir_learner_->addTargetKey("温度-");
+        // ir_learner_->addTargetKey("风速");
+        // ir_learner_->addTargetKey("上下扫风");
+        // ir_learner_->addTargetKey("左右扫风");
+        // ir_learner_->addTargetKey("定时");
+        //         ESP_LOGI(TAG, "预置学习按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时");
+        // 注意: ir_loop 任务不在此创建, 首次学习/回放时才按需启动 (EnsureIRLoopTask)
         ESP_LOGI(TAG, "IR learner ready");
     }
 
@@ -107,10 +252,12 @@ private:
                 }
                 std::string preset = properties["preset"].value<std::string>();
                 if (preset == "air_conditioner") {
+                    EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                     ir_learner_->learnAirConditioner();  // 内部会 reset + 添加空调按键 + startLearning
                     return "{\"success\": true, \"message\": \"开始学习空调按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时\"}";
                 }
                 if (preset == "tv") {
+                    EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                     ir_learner_->learnTV();  // 内部会 reset + 添加电视按键 + startLearning
                     return "{\"success\": true, \"message\": \"开始学习电视按键: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单\"}";
                 }
@@ -136,6 +283,7 @@ private:
                 if (ir_learner_->getKeys().empty()) {
                     return "{\"success\": false, \"message\": \"no keys specified\"}";
                 }
+                EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                 ir_learner_->startLearning();
                 return "{\"success\": true, \"message\": \"开始学习, 请按提示依次按键\"}";
             });
@@ -174,6 +322,7 @@ private:
                     return "{\"success\": false, \"message\": \"index out of range\"}";
                 }
                 ir_learner_->playKey(index);
+                EnsureIRLoopTask();  // 回放需要 ir_loop 任务执行实际发送
                 char resp[256];
                 snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"playing [%s]\", \"index\": %d}",
                          keys[index].name.c_str(), index);
