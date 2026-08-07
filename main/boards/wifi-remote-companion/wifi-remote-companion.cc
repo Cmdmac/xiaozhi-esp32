@@ -9,6 +9,7 @@
 #include "device_state.h"
 #include "alarm_manager.h"
 #include "codecs/mix_audio_codec.h"
+#include "assets/lang_config.h"
 
 #include "nvs_flash.h"
 
@@ -286,6 +287,10 @@ private:
         ir_learner_ = new IRLearner(IR_RX_GPIO, IR_TX_GPIO);
         ir_learner_->setup();
         ir_learner_->setIRSender(new IRSenderRMT(&ir_tx_));
+        // 捕获到按键时播放提示音, 让用户知道信号收到、可以松开遥控器并说"下一个"
+        ir_learner_->setOnKeyCaptured([]() {
+            Application::GetInstance().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        });
 
         // 开机从 NVS 恢复上次学习结果 (学习完成后由 ir_loop 任务自动保存)
         LoadIRKeysFromNVS();
@@ -302,8 +307,6 @@ private:
         // ir_learner_->addTargetKey("定时");
         //         ESP_LOGI(TAG, "预置学习按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时");
         // 注意: ir_loop 任务不在此创建, 首次学习/回放时才按需启动 (EnsureIRLoopTask)
-        EnsureIRLoopTask();
-        ESP_LOGI(TAG, "IR learner ready");
     }
 
     void InitializeTools() {
@@ -311,7 +314,7 @@ private:
 
         // ========== 空调控制 (全协议) ==========
         mcp_server.AddTool("self.ac.set_protocol",
-            "设置并记住空调品牌协议(保存到 NVS, 之后 self.ac.set 无需再传 protocol)。重要约束: 只有在用户明确说出空调品牌/型号时才能调用本工具; 禁止猜测、推断或默认空调品牌(如用户只说'打开空调'而未告知品牌, 绝不能调用本工具, 必须先向用户询问'你的空调是什么品牌')。protocol 可选: aux/ballu/carrier_mca/carrier_nqv/daikin_arc417/daikin_arc480/daikin/electroluxyal/fuego/fujitsu/gree/greeyaa/greeyan/greeyac/greeyt/greeyap/hisense_aud/hitachi/hyundai/ivt/midea/mitsubishi_fa/mitsubishi_fd/mitsubishi_fe/mitsubishi_heavy_fdtc/mitsubishi_heavy_zj/mitsubishi_heavy_zm/mitsubishi_heavy_zmp/mitsubishi_kj/mitsubishi_msc/mitsubishi_msy/mitsubishi_sez/panasonic_ckp/panasonic_dke/panasonic_eke/panasonic_jke/panasonic_lke/panasonic_nke/samsung_aqv/samsung_fjm/sharp/toshiba_daiseikai/toshiba/zhlt01/nibe/qlima_1/qlima_2/samsung_aqv12msan/zhjg01/airway/bgh_aud/panasonic_altdke/philco_phs32/vaillantvai8/r51m",
+            "设置并记住空调品牌协议(保存到 NVS, 之后 self.ac.set 无需再传 protocol)。重要约束: 只有在用户明确说出空调品牌/型号时才能调用本工具; 学习的时候不用调这个工具设置品牌；禁止猜测、推断或默认空调品牌(如用户只说'打开空调'而未告知品牌, 绝不能调用本工具, 必须先向用户询问'你的空调是什么品牌')。protocol 可选: aux/ballu/carrier_mca/carrier_nqv/daikin_arc417/daikin_arc480/daikin/electroluxyal/fuego/fujitsu/gree/greeyaa/greeyan/greeyac/greeyt/greeyap/hisense_aud/hitachi/hyundai/ivt/midea/mitsubishi_fa/mitsubishi_fd/mitsubishi_fe/mitsubishi_heavy_fdtc/mitsubishi_heavy_zj/mitsubishi_heavy_zm/mitsubishi_heavy_zmp/mitsubishi_kj/mitsubishi_msc/mitsubishi_msy/mitsubishi_sez/panasonic_ckp/panasonic_dke/panasonic_eke/panasonic_jke/panasonic_lke/panasonic_nke/samsung_aqv/samsung_fjm/sharp/toshiba_daiseikai/toshiba/zhlt01/nibe/qlima_1/qlima_2/samsung_aqv12msan/zhjg01/airway/bgh_aud/panasonic_altdke/philco_phs32/vaillantvai8/r51m",
             PropertyList({
                 Property("protocol", kPropertyTypeString, std::string(""))
             }),
@@ -458,60 +461,62 @@ private:
 
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
-            "开始红外学习。preset 可选 air_conditioner(空调)/tv(电视)/custom(自定义, 默认); custom 时用 keys 指定逗号分隔的按键名列表, 如 \"电源,模式,温度+,温度-\"。学习过程中请按提示依次用遥控器对准接收头按键",
+            "开始红外学习。重要: 用户说'学习空调/电视/遥控器按键'时, 必须直接调用本工具开始学习, 不要询问品牌、不要询问要学哪些键, 也不要跳过工具自行播报。"
+            "type 默认 air_conditioner(空调, 固定顺序: 电源/模式/温度+/温度-, 用户无需选择按键); tv(电视, 顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单); custom(自定义, 用 keys 指定逗号分隔的按键名列表)。"
+            "调用后工具返回的 message 就是你要播报的内容。学习流程: 每按完一个键设备会播放提示音表示收到, 然后用户说'下一个', 此时调用 self.ir.learn_status 获取下一键提示并播报(如'电源已学习, 请按[模式]键'); 全部学完后 learn_status 返回 learning=false, 播报'按键学习完成'",
             PropertyList({
-                Property("preset", kPropertyTypeString, std::string("custom")),
+                Property("type", kPropertyTypeString, std::string("air_conditioner")),
                 Property("keys", kPropertyTypeString, std::string(""))
             }),
             [this](const PropertyList& properties) -> ReturnValue {
                 if (ir_learner_ == nullptr) {
                     return "{\"success\": false, \"message\": \"IR learner not initialized\"}";
                 }
-                std::string preset = properties["preset"].value<std::string>();
-                if (preset == "air_conditioner") {
-                    // EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
-                    ir_learner_->learnAirConditioner();  // 内部会 reset + 添加空调按键 + startLearning
-                    return "{\"success\": true, \"message\": \"开始学习空调按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时\"}";
+                std::string type = properties["type"].value<std::string>();
+                EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
+                if (type == "tv") {
+                    ir_learner_->learnTV();  // 固定顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单
+                    return "{\"success\": true, \"message\": \"开始学习电视按键, 请先按[电源]键, 每按完一个键告诉我'下一个'\"}";
                 }
-                if (preset == "tv") {
-                    // EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
-                    ir_learner_->learnTV();  // 内部会 reset + 添加电视按键 + startLearning
-                    return "{\"success\": true, \"message\": \"开始学习电视按键: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单\"}";
+                if (type == "custom") {
+                    // 解析 keys (兼容中英文逗号与空格)
+                    ir_learner_->reset();
+                    std::string keys = properties["keys"].value<std::string>();
+                    for (auto& ch : keys) {
+                        if (ch == '，' || ch == ',') ch = ',';
+                    }
+                    size_t pos = 0;
+                    while ((pos = keys.find(',')) != std::string::npos) {
+                        std::string key = keys.substr(0, pos);
+                        key.erase(0, key.find_first_not_of(" \t\r\n"));
+                        key.erase(key.find_last_not_of(" \t\r\n") + 1);
+                        if (!key.empty()) ir_learner_->addTargetKey(key);
+                        keys.erase(0, pos + 1);
+                    }
+                    keys.erase(0, keys.find_first_not_of(" \t\r\n"));
+                    keys.erase(keys.find_last_not_of(" \t\r\n") + 1);
+                    if (!keys.empty()) ir_learner_->addTargetKey(keys);
+                    if (ir_learner_->getKeys().empty()) {
+                        return "{\"success\": false, \"message\": \"custom 模式需要提供 keys 按键列表\"}";
+                    }
+                    ir_learner_->startLearning();
+                    return "{\"success\": true, \"message\": \"开始学习自定义按键, 请先按[第一个键], 每按完一个键告诉我'下一个'\"}";
                 }
-
-                // custom: 解析 keys (兼容中英文逗号与空格)
-                ir_learner_->reset();
-                std::string keys = properties["keys"].value<std::string>();
-                for (auto& ch : keys) {
-                    if (ch == '，' || ch == ',') ch = ',';
-                }
-                size_t pos = 0;
-                while ((pos = keys.find(',')) != std::string::npos) {
-                    std::string key = keys.substr(0, pos);
-                    key.erase(0, key.find_first_not_of(" \t\r\n"));
-                    key.erase(key.find_last_not_of(" \t\r\n") + 1);
-                    if (!key.empty()) ir_learner_->addTargetKey(key);
-                    keys.erase(0, pos + 1);
-                }
-                keys.erase(0, keys.find_first_not_of(" \t\r\n"));
-                keys.erase(keys.find_last_not_of(" \t\r\n") + 1);
-                if (!keys.empty()) ir_learner_->addTargetKey(keys);
-
-                if (ir_learner_->getKeys().empty()) {
-                    return "{\"success\": false, \"message\": \"no keys specified\"}";
-                }
-                // EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
-                ir_learner_->startLearning();
-                return "{\"success\": true, \"message\": \"开始学习, 请按提示依次按键\"}";
+                // 默认: 空调
+                ir_learner_->learnAirConditioner();  // 固定顺序: 电源/模式/温度+/温度-
+                return "{\"success\": true, \"message\": \"开始学习空调按键, 请先按[电源]键, 每按完一个键告诉我'下一个'\"}";
             });
 
         mcp_server.AddTool("self.ir.learn_status",
-            "查询红外学习状态、当前按键清单与提示(应轮询此工具获知下一个要按的键)",
+            "查询红外学习状态与当前提示。用户每按完一个键并说'下一个'后, 必须调用本工具: 它会确认当前键已学习并推进到下一键。根据返回结果向用户播报: "
+            "若 learning=true, 播报 message 中的提示(如'电源已学习, 请按[模式]键'); 若 learning=false, 播报'按键学习完成'",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (ir_learner_ == nullptr) {
                     return "{\"success\": false, \"message\": \"IR learner not initialized\"}";
                 }
+                // 用户说"下一个" → 确认当前键并推进到下一键
+                ir_learner_->advanceToNextKey();
                 std::string msg = ir_learner_->getStatusMessage().c_str();
                 auto& keys = ir_learner_->getKeys();
                 std::string keylist = "[";
@@ -539,7 +544,7 @@ private:
                     return "{\"success\": false, \"message\": \"index out of range\"}";
                 }
                 ir_learner_->playKey(index);
-                // EnsureIRLoopTask();  // 回放需要 ir_loop 任务执行实际发送
+                EnsureIRLoopTask();  // 回放需要 ir_loop 任务执行实际发送
                 char resp[256];
                 snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"playing [%s]\", \"index\": %d}",
                          keys[index].name.c_str(), index);

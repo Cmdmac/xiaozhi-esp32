@@ -13,6 +13,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <functional>
 #include <IRSender.h>
 #include <remote_transmitter.h>
 
@@ -83,6 +84,9 @@ private:
     bool isSetup_ = false;
     bool irEnabled_ = false;  // 接收器是否已启用 (避免对 NULL timer 调用 disableIRIn)
 
+    // 捕获到一个有效按键后的回调 (外部用于播放提示音)
+    std::function<void()> on_key_captured_;
+
     // 非阻塞延时状态机: 捕获后等待一段时间再切到下一个键
     bool waitingAfterCapture_ = false;  // 正在等待(让用户松开遥控器)
     uint32_t waitStartMs_ = 0;          // 等待起始时刻
@@ -141,6 +145,11 @@ public:
         irSender_ = sender;
     }
 
+    // 设置捕获到有效按键时的回调 (外部播放提示音, 让用户知道收到信号了)
+    void setOnKeyCaptured(std::function<void()> cb) {
+        on_key_captured_ = std::move(cb);
+    }
+
     // 初始化
     void setup() {
         // 创建接收器 (GPIO 中断方式, 不用 RMT)
@@ -194,10 +203,10 @@ public:
         addTargetKey("模式");
         addTargetKey("温度+");
         addTargetKey("温度-");
-        addTargetKey("风速");
-        addTargetKey("上下扫风");
-        addTargetKey("左右扫风");
-        addTargetKey("定时");
+        // addTargetKey("风速");
+        // addTargetKey("上下扫风");
+        // addTargetKey("左右扫风");
+        // addTargetKey("定时");
         startLearning();
     }
 
@@ -230,6 +239,26 @@ public:
         }
     }
 
+    // 用户说"下一个"后由 learn_status 工具调用: 确认当前键已学习并推进到下一键
+    // 返回 true 表示还有键要学(或当前键还没捕获, 保持原提示); false 表示学习已结束
+    bool advanceToNextKey() {
+        if (!isSessionActive_) return false;
+        if (waitingAfterCapture_) {
+            // 还在冷却期(用户已确认当前键学完) → 立即推进, 让模型能马上播报下一键提示
+            waitingAfterCapture_ = false;
+            if (receiver_) receiver_->resume();
+            currentKeyIndex_++;
+            if (currentKeyIndex_ < (int)keys_.size()) {
+                promptUser();
+                return true;
+            }
+            stopLearning();
+            return false;
+        }
+        // 已自动推进或当前键还没捕获 → 返回当前提示
+        return true;
+    }
+
     // 主循环 (在 Arduino loop 中调用)
     void loop() {
         // 先处理待发送的红外指令 (从主循环执行, 避免 Web 任务时序干扰)
@@ -237,25 +266,21 @@ public:
 
         if (!isSessionActive_ || !receiver_) return;
 
-        // 捕获后等待状态: 让用户松开遥控器, 避免连发码被当作下一个键
-        // 非阻塞, 期间 BOOT 按钮仍可正常响应
+        // 捕获后的冷却期: 丢弃连发码(用户按住遥控器会连发多帧), 冷却结束后
+        // 自动推进到下一个键并继续接收, 保证用户按下一个键时一定能被捕获。
+        // 语音提示由模型负责: 用户说"下一个"后 learn_status 返回当前键提示并播报
         if (waitingAfterCapture_) {
-            if ((xTaskGetTickCount() * portTICK_PERIOD_MS) - waitStartMs_ < 1000) {
-                return;  // 还没到 1 秒, 先返回让主 loop 处理其他事
-            }
-            // 到时间了, 清空等待期间捕获的噪声/连发码
-            waitingAfterCapture_ = false;
-            receiver_->resume();
-
-            currentKeyIndex_++;
-            if (currentKeyIndex_ < (int)keys_.size()) {
-                promptUser();
-            } else {
-                stopLearning();
+            if ((xTaskGetTickCount() * portTICK_PERIOD_MS) - waitStartMs_ >= 1500) {
+                waitingAfterCapture_ = false;
+                currentKeyIndex_++;
+                if (currentKeyIndex_ < (int)keys_.size()) {
+                    promptUser();  // 自动推进到下一个键, 等待用户按键
+                } else {
+                    stopLearning();
+                }
             }
             return;
         }
-
         if (receiver_->decode(&results_)) {
             uint16_t rawlen = results_.rawlen;
 
@@ -306,7 +331,9 @@ public:
             }
 
             receiver_->resume();
-            // 进入非阻塞等待状态 (替代原来的 vTaskDelay(1000))
+            // 播放捕获提示音 (告知用户收到信号, 可以松开遥控器)
+            if (on_key_captured_) on_key_captured_();
+            // 进入等待确认状态: 等用户说"下一个"后由 learn_status 推进
             waitingAfterCapture_ = true;
             waitStartMs_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
         }
