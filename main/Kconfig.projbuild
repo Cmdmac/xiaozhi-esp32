@@ -125,6 +125,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_C3NOCODEC_BOX
         bool "C3NoCodec Box"
         depends on IDF_TARGET_ESP32C3
+    config BOARD_TYPE_WIFI_REMOTE_COMPANION
+        bool "WiFi Remote Companion (wifi遥控伴侣)"
+        depends on IDF_TARGET_ESP32C3
     config BOARD_TYPE_S3SUPERMINI_BOX
         bool "S3SuperMini Box"
         depends on IDF_TARGET_ESP32S3
