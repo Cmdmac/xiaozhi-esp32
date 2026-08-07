@@ -833,6 +833,28 @@ else()
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
 
+# wifi-remote-companion (WiFi遥控伴侣): 红外遥控子模块 (纯学习模式, 不编译空调协议库)
+# 顶层 glob 只收集 *.cc/*.c, 这里显式加入子目录中的红外发射/学习源文件
+if(CONFIG_BOARD_TYPE_WIFI_REMOTE_COMPANION)
+    list(APPEND SOURCES
+        "boards/wifi-remote-companion/remote_transmitter/remote_transmitter.cpp"
+        "boards/wifi-remote-companion/learner/irremote8266/IRrecv.cpp"
+        "boards/wifi-remote-companion/learner/irremote8266/IRutils.cpp"
+        "boards/wifi-remote-companion/learner/irremote8266/IRtext.cpp"
+        # IRSender 基类实现(IRLearner 的 IRSenderRMT 桥接需要其构造/虚函数; 不含空调协议库)
+        "boards/wifi-remote-companion/ac/heatpumpir/IRSender.cpp"
+    )
+    list(APPEND INCLUDE_DIRS
+        "boards/wifi-remote-companion"
+        "boards/wifi-remote-companion/remote_transmitter"
+        "boards/wifi-remote-companion/learner/include"
+        "boards/wifi-remote-companion/learner/irremote8266"
+        # IRLearner 依赖 heatpumpir 的 IRSender.h/HeatpumpIRCompat.h 头文件(仅头文件, 不编译其源文件)
+        "boards/wifi-remote-companion/ac"
+        "boards/wifi-remote-companion/ac/heatpumpir"
+    )
+endif()
+
 # Select audio processor according to Kconfig
 if(CONFIG_USE_AUDIO_PROCESSOR)
     list(APPEND SOURCES "audio/processors/afe_audio_processor.cc")
@@ -1006,6 +1028,10 @@ idf_component_register(SRCS ${SOURCES}
                         esp_driver_spi
                         esp_driver_i2c
                         esp_driver_i2s
+                        esp_driver_rmt
+                        esp_driver_gptimer
+                        esp_rom
+                        esp_timer
                         esp_driver_jpeg
                         esp_driver_ppa
                         esp_app_format

@@ -21,6 +21,13 @@
 
 // 本板卡无屏幕，不定义任何 DISPLAY_* 引脚
 
+// ===== 红外遥控 =====
+// IR 发射（红外 LED）: GPIO3
+// IR 接收（一体化接收头，信号脚输出低电平表示有载波）: GPIO6
+// 如需改接，请按实际硬件调整这两个引脚（避免使用 GPIO2/GPIO8/GPIO9 等 strapping 引脚）
+#define IR_TX_GPIO                  GPIO_NUM_3
+#define IR_RX_GPIO                  GPIO_NUM_6
+
 // #define RESET_NVS_BUTTON_GPIO        GPIO_NUM_12
 
 #endif // _BOARD_CONFIG_H_
