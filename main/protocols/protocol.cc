@@ -2,6 +2,8 @@
 
 #include <esp_log.h>
 
+#include <new>
+
 #define TAG "Protocol"
 
 void Protocol::OnIncomingJson(std::function<void(const cJSON* root)> callback) {
@@ -74,8 +76,21 @@ void Protocol::SendStopListening() {
 }
 
 void Protocol::SendMcpMessage(const std::string& payload) {
-    std::string message = "{\"session_id\":\"" + session_id_ + "\",\"type\":\"mcp\",\"payload\":" + payload + "}";
-    SendText(message);
+    try {
+        // 预分配一次到位, 避免多次 += 触发反复重分配(内存紧张时易 OOM)
+        std::string message;
+        message.reserve(session_id_.size() + payload.size() + 64);
+        message += "{\"session_id\":\"";
+        message += session_id_;
+        message += "\",\"type\":\"mcp\",\"payload\":";
+        message += payload;
+        message += "}";
+        SendText(message);
+    } catch (const std::bad_alloc&) {
+        // 内存不足时丢弃该条 MCP 消息, 避免 bad_alloc 未捕获导致 abort 崩溃
+        ESP_LOGE(TAG, "SendMcpMessage: out of memory, dropped %d-byte payload",
+                 (int)payload.size());
+    }
 }
 
 bool Protocol::IsTimeout() const {
