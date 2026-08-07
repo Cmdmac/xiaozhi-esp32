@@ -11,14 +11,17 @@
 //     IRremoteESP8266 ESP32 code takes the "core v3" path (V3PLUS).  That path
 //     only needs timerBegin(freq)/timerWrite/timerAlarm/timerAttachInterrupt/
 //     timerDetachInterrupt/timerEnd and hw_timer_t, which we provide on top of
-//     the IDF gptimer driver (the raw-register hack of old Arduino cores does
-//     not match the ESP32-C3 timer group layout and is compiled out).
+//     the IDF esp_timer one-shot timer (the raw-register hack of old Arduino
+//     cores does not match the ESP32-C3 timer group layout and is compiled
+//     out).
 //   * attachInterrupt()/detachInterrupt() map onto the IDF GPIO ISR service
 //     with a tiny dispatch table (IRrecv's ISR is already USE_IRAM_ATTR).
 //
-// The ISR-context calls (gpio_intr -> timerWrite/timerAlarm) go through the
-// gptimer driver; build with CONFIG_GPTIMER_ISR_IRAM_SAFE=y so those driver
-// functions are IRAM-resident and safe to call from an ISR.
+// The ISR-context calls (gpio_intr -> timerWrite/timerAlarm) map to
+// esp_timer_stop()/esp_timer_start_once(), which are IRAM-resident in IDF and
+// safe to call from an ISR.  The timeout callback (IRrecv read_timeout) runs
+// in the esp_timer task context, matching IRrecv's expectation of a one-shot
+// "90ms no-more-edges" timeout on every captured edge.
 
 #ifndef ARDUINO_H_SHIM
 #define ARDUINO_H_SHIM
@@ -32,7 +35,7 @@
 #include <esp_system.h>       // esp_restart()
 #include <esp_attr.h>         // IRAM_ATTR
 #include <driver/gpio.h>
-#include "driver/gptimer.h"
+#include "esp_timer.h"
 
 // ---------------------------------------------------------------------------
 // ESP32 Arduino core version - force "core v3" semantics for IRremoteESP8266.
@@ -88,87 +91,80 @@ class EspClass {
 static EspClass ESP;
 
 // ---------------------------------------------------------------------------
-// hw_timer_t - Arduino-ESP32-core v3 style hardware timer on top of gptimer.
+// hw_timer_t - Arduino-ESP32-core v3 style hardware timer on top of esp_timer.
+// IRrecv 的 V3PLUS 路径只把定时器当作"一次性超时"用: 每个边沿 timerWrite(0) +
+// timerAlarm(90ms)。esp_timer_start_once()/esp_timer_stop() 在 IDF 中位于 IRAM
+// 且可从 ISR 调用, 因此 gpio_intr 里可以直接重臂超时, 没有旧 gptimer 封装那种
+// 驱动调用语义/ISR 上下文的偏差。
 // ---------------------------------------------------------------------------
 typedef struct hw_timer_s {
-  gptimer_handle_t handle{nullptr};
+  esp_timer_handle_t handle{nullptr};
   uint32_t resolution_hz{1000000};
-  bool enabled{false};  // gptimer_enable() called
-  bool running{false};  // gptimer_start() called
   void (*fn)(void){nullptr};
 } hw_timer_t;
 
-static bool IRAM_ATTR timer_isr_trampoline(gptimer_handle_t handle,
-                                           const gptimer_alarm_event_data_t *edata,
-                                           void *ctx) {
-  hw_timer_t *t = static_cast<hw_timer_t *>(ctx);
+// esp_timer 回调在 esp_timer 任务上下文中执行, 在这里转发给 IRrecv 的 read_timeout。
+static void timer_isr_trampoline(void *arg) {
+  hw_timer_t *t = static_cast<hw_timer_t *>(arg);
   if (t && t->fn) {
     t->fn();
   }
-  return false;  // let the driver handle reload behaviour
 }
 
 // core v3 signature: timerBegin(frequency_hz)
 inline hw_timer_t *timerBegin(uint32_t freq) {
   hw_timer_t *t = new hw_timer_t();
   t->resolution_hz = freq;
-  gptimer_config_t cfg = {};
-  cfg.clk_src = GPTIMER_CLK_SRC_DEFAULT;
-  cfg.resolution_hz = freq;
-  cfg.flags.intr_shared = true;
-  if (gptimer_new_timer(&cfg, &t->handle) != ESP_OK) {
+  esp_timer_create_args_t args = {};
+  args.callback = timer_isr_trampoline;
+  args.arg = t;
+  args.name = "ir_timeout";
+  if (esp_timer_create(&args, &t->handle) != ESP_OK) {
     delete t;
     return nullptr;
   }
   return t;
 }
 
+// "重置定时器": esp_timer 一次性定时器不支持回写计数值, 取消未触发的超时即可;
+// 重新计时由随后的 timerAlarm() 完成。
 inline void timerWrite(hw_timer_t *t, uint64_t value) {
-  if (t && t->handle) gptimer_set_raw_count(t->handle, value);
+  (void)value;
+  if (t && t->handle) esp_timer_stop(t->handle);
 }
 
 // core v3 signature: timerAlarm(timer, alarm_us, autoreload, countUp)
+// 先从 ISR 安全地停掉上一个未触发的超时, 再重新启动, 保证每次边沿后 alarm_us 超时有效。
 inline void timerAlarm(hw_timer_t *t, uint64_t alarm_us, bool autoreload,
                        uint64_t countUp) {
   (void)countUp;
   if (!t || !t->handle) return;
-  gptimer_alarm_config_t alarm = {};
-  alarm.alarm_count = alarm_us;
-  alarm.reload_count = 0;
-  alarm.flags.auto_reload_on_alarm = autoreload;
-  gptimer_set_alarm_action(t->handle, &alarm);
-  if (!t->running) {
-    if (gptimer_start(t->handle) == ESP_OK) t->running = true;
+  esp_timer_stop(t->handle);
+  if (autoreload) {
+    esp_timer_start_periodic(t->handle, alarm_us);
+  } else {
+    esp_timer_start_once(t->handle, alarm_us);
   }
 }
 
 // core v3 signature: timerAttachInterrupt(timer, callback)
 inline void timerAttachInterrupt(hw_timer_t *t, void (*fn)(void)) {
-  if (!t || !t->handle) return;
+  if (!t) return;
   t->fn = fn;
-  gptimer_event_callbacks_t cbs = {};
-  cbs.on_alarm = timer_isr_trampoline;
-  gptimer_register_event_callbacks(t->handle, &cbs, t);
-  if (gptimer_enable(t->handle) == ESP_OK) t->enabled = true;
 }
 
 inline void timerDetachInterrupt(hw_timer_t *t) {
   if (!t) return;
   t->fn = nullptr;
-  if (t->enabled && t->handle) {
-    gptimer_disable(t->handle);
-    t->enabled = false;
-  }
+  if (t->handle) esp_timer_stop(t->handle);
 }
 
 inline void timerEnd(hw_timer_t *t) {
   if (!t) return;
   timerDetachInterrupt(t);
-  if (t->running && t->handle) {
-    gptimer_stop(t->handle);
-    t->running = false;
+  if (t->handle) {
+    esp_timer_delete(t->handle);
   }
-  if (t->handle) gptimer_del_timer(t->handle);
   delete t;
 }
 

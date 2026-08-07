@@ -155,6 +155,10 @@ class HeatPumpClimate {
   // Switch protocol at runtime; recreates the protocol handler.
   esp_err_t set_protocol(Protocol protocol);
 
+  // Release the current protocol handler. After this, transmit_state() returns
+  // ESP_ERR_INVALID_STATE until set_protocol() is called again.
+  void reset() { release_protocol_(); }
+
   void set_min_temperature(float t) { min_temperature_ = t; }
   void set_max_temperature(float t) { max_temperature_ = t; }
   void set_vertical_default(VerticalDirection v) { default_vertical_ = v; }
