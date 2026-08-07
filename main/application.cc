@@ -627,28 +627,28 @@ void Application::InitializeProtocol() {
     protocol_->Start();
 
     // 初始化 OpenClawWebSocket 连接
-    openclaw_websocket_ = std::make_unique<OpenClawWebSocket>();
-    OpenClawWebSocketCallbacks callbacks;
-    callbacks.on_audio_data_callback = [this](const std::vector<uint8_t>& data, AudioType audioType) {
-        // ESP_LOGI(TAG, "ReceiveFromOpenClaw audioType: %d", audioType);             
-        audio_service_.ReceiveFromOpenClaw(data, audioType);
-    };
-    callbacks.on_start_send_audio = [this](AudioType audioType, size_t size) {
-        ESP_LOGW(TAG, "Start receive audio: %d, size: %d", audioType, size);
-    };
-    callbacks.on_end_send_audio = [this](AudioType audioType) {
-        ESP_LOGW(TAG, "End receive audio: %d", audioType);
-        WakeUpFromOpenClaw();    
-    };
-    openclaw_websocket_->SetCallbacks(callbacks);
+    // openclaw_websocket_ = std::make_unique<OpenClawWebSocket>();
+    // OpenClawWebSocketCallbacks callbacks;
+    // callbacks.on_audio_data_callback = [this](const std::vector<uint8_t>& data, AudioType audioType) {
+    //     // ESP_LOGI(TAG, "ReceiveFromOpenClaw audioType: %d", audioType);             
+    //     audio_service_.ReceiveFromOpenClaw(data, audioType);
+    // };
+    // callbacks.on_start_send_audio = [this](AudioType audioType, size_t size) {
+    //     ESP_LOGW(TAG, "Start receive audio: %d, size: %d", audioType, size);
+    // };
+    // callbacks.on_end_send_audio = [this](AudioType audioType) {
+    //     ESP_LOGW(TAG, "End receive audio: %d", audioType);
+    //     WakeUpFromOpenClaw();    
+    // };
+    // openclaw_websocket_->SetCallbacks(callbacks);
 
-    if (!openclaw_websocket_->IsConnected()) {
-        ESP_LOGW(TAG, "Connecting to WebSocket server...");
-        if (openclaw_websocket_->Connect("ws://47.112.18.149:8765/websocket")) {
-            ESP_LOGW(TAG, "Connected to WebSocket server");
-            // openclaw_websocket_->SendText("hello");
-        }
-    }
+    // if (!openclaw_websocket_->IsConnected()) {
+    //     ESP_LOGW(TAG, "Connecting to WebSocket server...");
+    //     if (openclaw_websocket_->Connect("ws://47.112.18.149:8765/websocket")) {
+    //         ESP_LOGW(TAG, "Connected to WebSocket server");
+    //         // openclaw_websocket_->SendText("hello");
+    //     }
+    // }
     
 }
 

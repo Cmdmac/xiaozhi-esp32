@@ -9,10 +9,10 @@
 // 配置PDM上采样fs参数（取值范围<=480）。部分设备在441时表现更稳定
 #define AUDIO_PDM_UPSAMPLE_FS    441
 
-#define AUDIO_ADC_MIC_CHANNEL       ADC_CHANNEL_1
+#define AUDIO_ADC_MIC_CHANNEL       ADC_CHANNEL_0
 #define AUDIO_PDM_SPEAK_P_GPIO      GPIO_NUM_4
-#define AUDIO_PDM_SPEAK_N_GPIO      GPIO_NUM_0
-#define AUDIO_PA_CTL_GPIO           GPIO_NUM_5
+#define AUDIO_PDM_SPEAK_N_GPIO      GPIO_NUM_1
+#define AUDIO_PA_CTL_GPIO           GPIO_NUM_10
 
 #define BUILTIN_LED_GPIO            GPIO_NUM_NC
 #define BOOT_BUTTON_GPIO            GPIO_NUM_9
@@ -26,7 +26,7 @@
 // IR 接收（一体化接收头，信号脚输出低电平表示有载波）: GPIO6
 // 如需改接，请按实际硬件调整这两个引脚（避免使用 GPIO2/GPIO8/GPIO9 等 strapping 引脚）
 #define IR_TX_GPIO                  GPIO_NUM_3
-#define IR_RX_GPIO                  GPIO_NUM_6
+#define IR_RX_GPIO                  GPIO_NUM_5
 
 // #define RESET_NVS_BUTTON_GPIO        GPIO_NUM_12
 

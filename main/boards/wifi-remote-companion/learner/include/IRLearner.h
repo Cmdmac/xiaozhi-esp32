@@ -20,6 +20,8 @@
 using heatpump_ir_tx::RemoteTransmitter;
 using heatpump_ir_tx::RemoteTransmitData;
 
+const static char* TAG = "IRLearner";
+
 // 原始红外码结构 (mark/space 交替的微秒数组)
 struct IRRawKey {
     String name;
@@ -84,6 +86,7 @@ private:
     // 非阻塞延时状态机: 捕获后等待一段时间再切到下一个键
     bool waitingAfterCapture_ = false;  // 正在等待(让用户松开遥控器)
     uint32_t waitStartMs_ = 0;          // 等待起始时刻
+    uint32_t lastDiagMs_ = 0;           // 上次诊断日志时间(学习模式边沿计数)
 
     // 最近一次状态消息 (供网页查询)
     String lastStatusMsg_ = "空闲";
@@ -97,10 +100,10 @@ private:
     void promptUser() {
         if (currentKeyIndex_ >= 0 && currentKeyIndex_ < (int)keys_.size()) {
             lastStatusMsg_ = "请按下遥控器的 [" + keys_[currentKeyIndex_].name + "] 键";
-            ESP_LOGI("IRLearner2", "--------------------------------");
-            ESP_LOGI("IRLearner2", ">>> 请按下遥控器的 [%s] 键 <<<",
+            ESP_LOGI(TAG, "--------------------------------");
+            ESP_LOGI(TAG, ">>> 请按下遥控器的 [%s] 键 <<<",
                      keys_[currentKeyIndex_].name.c_str());
-            ESP_LOGI("IRLearner2", "--------------------------------");
+            ESP_LOGI(TAG, "--------------------------------");
         } else {
             stopLearning();
         }
@@ -117,9 +120,9 @@ private:
             irEnabled_ = false;
         }
         lastStatusMsg_ = "学习完成!";
-        ESP_LOGI("IRLearner2", "===========================");
-        ESP_LOGI("IRLearner2", "  所有按键学习完成!");
-        ESP_LOGI("IRLearner2", "===========================");
+        ESP_LOGI(TAG, "===========================");
+        ESP_LOGI(TAG, "  所有按键学习完成!");
+        ESP_LOGI(TAG, "===========================");
     }
 
 public:
@@ -148,7 +151,7 @@ public:
         // 注意: 不在此处 enableIRIn(), 避免开机后一直捕获噪声污染缓冲区
         // 接收器只在 startLearning() 时才开启
         isSetup_ = true;
-        ESP_LOGI("IRLearner2", "初始化完成 (RX: GPIO%d, TX: GPIO%d, buf:512, timeout:90ms)",
+        ESP_LOGI(TAG, "初始化完成 (RX: GPIO%d, TX: GPIO%d, buf:512, timeout:90ms)",
                  rx_pin_, tx_pin_);
     }
 
@@ -162,7 +165,7 @@ public:
     // 开始学习
     void startLearning() {
         if (keys_.empty()) {
-            ESP_LOGE("IRLearner2", "错误: 请先添加按键!");
+            ESP_LOGE(TAG, "错误: 请先添加按键!");
             return;
         }
         if (!isSetup_) setup();
@@ -180,7 +183,7 @@ public:
         currentKeyIndex_ = 0;
         waitingAfterCapture_ = false;  // 清除等待状态
         lastStatusMsg_ = "开始学习模式...";
-        ESP_LOGI("IRLearner2", "开始学习模式...");
+        ESP_LOGI(TAG, "开始学习模式...");
         promptUser();
     }
 
@@ -217,7 +220,7 @@ public:
         if (!isSessionActive_) return;
         if (currentKeyIndex_ >= 0 && currentKeyIndex_ < (int)keys_.size()) {
             lastStatusMsg_ = "跳过 [" + keys_[currentKeyIndex_].name + "]";
-            ESP_LOGI("IRLearner2", ">> 跳过按键 [%s]",
+            ESP_LOGI(TAG, ">> 跳过按键 [%s]",
                      keys_[currentKeyIndex_].name.c_str());
             // 清空可能已捕获的噪声, 避免下一个按键误触发
             if (receiver_) receiver_->resume();
@@ -257,20 +260,20 @@ public:
             uint16_t rawlen = results_.rawlen;
 
             // 临时调试: 打印 decode 详情, 排查 rawlen=0 问题
-            ESP_LOGW("IRLearner2", "[DBG] decode=true rawlen=%u overflow=%u type=%d bits=%u",
+            ESP_LOGW(TAG, "[DBG] decode=true rawlen=%u overflow=%u type=%d bits=%u",
                      rawlen, results_.overflow, (int)results_.decode_type, results_.bits);
 
             if (rawlen < 5) {
-                ESP_LOGW("IRLearner2", "忽略干扰 (rawlen=%d)...", rawlen);
+                ESP_LOGW(TAG, "忽略干扰 (rawlen=%d)...", rawlen);
                 receiver_->resume();
                 return;
             }
 
             if (results_.overflow) {
-                ESP_LOGW("IRLearner2", "警告: 缓冲区溢出! rawlen=%d, 信号被截断, 请增大缓冲区", rawlen);
+                ESP_LOGW(TAG, "警告: 缓冲区溢出! rawlen=%d, 信号被截断, 请增大缓冲区", rawlen);
             }
 
-            ESP_LOGI("IRLearner2", "捕获成功! rawlen: %d%s", rawlen,
+            ESP_LOGI(TAG, "捕获成功! rawlen: %d%s", rawlen,
                      results_.overflow ? " (溢出!)" : "");
 
             // 保存原始数据 (rawbuf[0] 忽略, 从 rawbuf[1] 开始)
@@ -288,17 +291,17 @@ public:
                 k.stateLen = results_.bits / 8;
                 if (k.stateLen > 0 && k.stateLen <= sizeof(k.state)) {
                     memcpy(k.state, results_.state, k.stateLen);
-                    ESP_LOGI("IRLearner2", ">> [%s] 解码: %s (%d 字节)",
+                    ESP_LOGI(TAG, ">> [%s] 解码: %s (%d 字节)",
                              k.name.c_str(),
                              typeToString(k.protocol).c_str(),
                              k.stateLen);
                 } else {
-                    ESP_LOGI("IRLearner2", ">> [%s] 未识别协议, 使用原始码回放",
+                    ESP_LOGI(TAG, ">> [%s] 未识别协议, 使用原始码回放",
                              k.name.c_str());
                 }
 
                 lastStatusMsg_ = "[" + k.name + "] 已保存 (" + std::to_string((int)k.rawData.size()) + " 符号)";
-                ESP_LOGI("IRLearner2", ">> [%s] 已保存 (%d 符号)",
+                ESP_LOGI(TAG, ">> [%s] 已保存 (%d 符号)",
                          k.name.c_str(), (int)k.rawData.size());
             }
 
@@ -312,20 +315,20 @@ public:
     // 发射指定按键 (设置标记, 在 loop() 中执行, 避免 Web 任务时序干扰)
     void playKey(int index) {
         if (index < 0 || index >= (int)keys_.size()) {
-            ESP_LOGE("IRLearner2", "索引越界!");
+            ESP_LOGE(TAG, "索引越界!");
             return;
         }
         IRRawKey& k = keys_[index];
         if (!k.isLearned) {
-            ESP_LOGW("IRLearner2", "[%s] 尚未学习, 跳过", k.name.c_str());
+            ESP_LOGW(TAG, "[%s] 尚未学习, 跳过", k.name.c_str());
             return;
         }
         if (k.rawData.empty()) {
-            ESP_LOGE("IRLearner2", "[%s] 数据为空!", k.name.c_str());
+            ESP_LOGE(TAG, "[%s] 数据为空!", k.name.c_str());
             return;
         }
         pendingPlayKey_ = index;  // 标记待发送, loop() 里执行
-        ESP_LOGI("IRLearner2", "排队发射 [%s]", k.name.c_str());
+        ESP_LOGI(TAG, "排队发射 [%s]", k.name.c_str());
     }
 
     // 在 loop() 中执行实际发送 (用 heatpumpir IRSender 的 mark/space)
@@ -337,11 +340,11 @@ public:
         IRRawKey& k = keys_[index];
 
         if (!irSender_) {
-            ESP_LOGE("IRLearner2", "IR 发送器未设置!");
+            ESP_LOGE(TAG, "IR 发送器未设置!");
             return;
         }
         if (k.rawData.empty()) {
-            ESP_LOGE("IRLearner2", "[%s] 数据为空!", k.name.c_str());
+            ESP_LOGE(TAG, "[%s] 数据为空!", k.name.c_str());
             return;
         }
 
@@ -355,21 +358,21 @@ public:
         }
         // 约定: space(0) 表示帧结束, 桥接发送器在此一次性提交给 RMT 硬件
         irSender_->space(0);
-        ESP_LOGI("IRLearner2", ">> [%s] 发送完成", k.name.c_str());
+        ESP_LOGI(TAG, ">> [%s] 发送完成", k.name.c_str());
     }
 
     // 批量回放
     void replayAll() {
         if (keys_.empty()) {
-            ESP_LOGW("IRLearner2", "没有按键可回放!");
+            ESP_LOGW(TAG, "没有按键可回放!");
             return;
         }
-        ESP_LOGI("IRLearner2", "--- 批量回放测试 ---");
+        ESP_LOGI(TAG, "--- 批量回放测试 ---");
         for (int i = 0; i < (int)keys_.size(); i++) {
             playKey(i);
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
-        ESP_LOGI("IRLearner2", "--- 回放结束 ---");
+        ESP_LOGI(TAG, "--- 回放结束 ---");
     }
 
     // 重置
@@ -383,13 +386,13 @@ public:
 
     // 打印所有原始码详细数据
     void printAllRawData() {
-        ESP_LOGI("IRLearner2", "==========================================");
-        ESP_LOGI("IRLearner2", "所有学习的红外原始码:");
-        ESP_LOGI("IRLearner2", "==========================================");
+        ESP_LOGI(TAG, "==========================================");
+        ESP_LOGI(TAG, "所有学习的红外原始码:");
+        ESP_LOGI(TAG, "==========================================");
 
         for (size_t i = 0; i < keys_.size(); i++) {
             IRRawKey& k = keys_[i];
-            ESP_LOGI("IRLearner2", "[%d] %s - %s (共 %d 符号, 协议: %s)",
+            ESP_LOGI(TAG, "[%d] %s - %s (共 %d 符号, 协议: %s)",
                      (int)i, k.name.c_str(),
                      k.isLearned ? "已学习" : "未学习",
                      (int)k.rawData.size(),
@@ -399,11 +402,11 @@ public:
                 // 打印详细时序 (前20个)
                 for (size_t j = 0; j < std::min(k.rawData.size(), (size_t)20); j++) {
                     const char* type = (j % 2 == 0) ? "MARK" : "SPACE";
-                    ESP_LOGI("IRLearner2", "  [%02d] %s: %dus",
+                    ESP_LOGI(TAG, "  [%02d] %s: %dus",
                              (int)j, type, k.rawData[j]);
                 }
                 if (k.rawData.size() > 20) {
-                    ESP_LOGI("IRLearner2", "  ... 还有 %d 个符号",
+                    ESP_LOGI(TAG, "  ... 还有 %d 个符号",
                              (int)k.rawData.size() - 20);
                 }
             }

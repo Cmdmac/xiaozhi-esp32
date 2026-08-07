@@ -48,7 +48,7 @@ private:
     // 红外遥控硬件
     RemoteTransmitter ir_tx_;
     HeatPumpClimate climate_;
-    std::string ac_protocol_name_{"panasonic_lke"};  // 当前空调品牌协议名
+    std::string ac_protocol_name_{""};  // 当前空调品牌协议名
     bool ac_protocol_configured_ = false;            // 是否已显式设置过品牌(NVS/set_protocol)
     IRLearner* ir_learner_ = nullptr;
     TaskHandle_t ir_task_ = nullptr;
@@ -116,6 +116,21 @@ private:
         nvs_close(h);
         if (err != ESP_OK) return "";
         return std::string(buf);
+    }
+
+    // 清除已保存的空调品牌协议
+    void ClearACProtocolFromNVS() {
+        nvs_handle_t h;
+        if (nvs_open(IR_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+        esp_err_t err = nvs_erase_key(h, IR_NVS_AC_PROTOCOL_KEY);
+        if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;  // 本来就没有, 不算错误
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "空调品牌协议已清除");
+        } else {
+            ESP_LOGE(TAG, "清除空调品牌协议失败: %s", esp_err_to_name(err));
+        }
     }
 
     // ===== 学习结果 NVS 持久化 =====
@@ -248,8 +263,8 @@ private:
         }
         ir_tx_.set_carrier_duty_percent(33);
 
-        // 空调控制: 默认协议 Panasonic LKE, 可通过 self.ac.set/set_protocol 切换品牌并持久化
-        esp_err_t cerr = climate_.begin(&ir_tx_, heatpump_ir_tx::Protocol::PANASONIC_LKE);
+        // 空调控制: 默认协议 Panasonic DKE(本机空调型号), 可通过 self.ac.set/set_protocol 切换品牌并持久化
+        esp_err_t cerr = climate_.begin(&ir_tx_, heatpump_ir_tx::Protocol::PANASONIC_DKE);
         if (cerr != ESP_OK) {
             ESP_LOGE(TAG, "AC climate begin failed: %s", esp_err_to_name(cerr));
         }
@@ -287,6 +302,7 @@ private:
         // ir_learner_->addTargetKey("定时");
         //         ESP_LOGI(TAG, "预置学习按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时");
         // 注意: ir_loop 任务不在此创建, 首次学习/回放时才按需启动 (EnsureIRLoopTask)
+        EnsureIRLoopTask();
         ESP_LOGI(TAG, "IR learner ready");
     }
 
@@ -295,12 +311,15 @@ private:
 
         // ========== 空调控制 (全协议) ==========
         mcp_server.AddTool("self.ac.set_protocol",
-            "设置并记住空调品牌协议(保存到 NVS, 之后 self.ac.set 无需再传 protocol)。protocol 可选: aux/ballu/carrier_mca/carrier_nqv/daikin_arc417/daikin_arc480/daikin/electroluxyal/fuego/fujitsu/gree/greeyaa/greeyan/greeyac/greeyt/greeyap/hisense_aud/hitachi/hyundai/ivt/midea/mitsubishi_fa/mitsubishi_fd/mitsubishi_fe/mitsubishi_heavy_fdtc/mitsubishi_heavy_zj/mitsubishi_heavy_zm/mitsubishi_heavy_zmp/mitsubishi_kj/mitsubishi_msc/mitsubishi_msy/mitsubishi_sez/panasonic_ckp/panasonic_dke/panasonic_eke/panasonic_jke/panasonic_lke/panasonic_nke/samsung_aqv/samsung_fjm/sharp/toshiba_daiseikai/toshiba/zhlt01/nibe/qlima_1/qlima_2/samsung_aqv12msan/zhjg01/airway/bgh_aud/panasonic_altdke/philco_phs32/vaillantvai8/r51m",
+            "设置并记住空调品牌协议(保存到 NVS, 之后 self.ac.set 无需再传 protocol)。重要约束: 只有在用户明确说出空调品牌/型号时才能调用本工具; 禁止猜测、推断或默认空调品牌(如用户只说'打开空调'而未告知品牌, 绝不能调用本工具, 必须先向用户询问'你的空调是什么品牌')。protocol 可选: aux/ballu/carrier_mca/carrier_nqv/daikin_arc417/daikin_arc480/daikin/electroluxyal/fuego/fujitsu/gree/greeyaa/greeyan/greeyac/greeyt/greeyap/hisense_aud/hitachi/hyundai/ivt/midea/mitsubishi_fa/mitsubishi_fd/mitsubishi_fe/mitsubishi_heavy_fdtc/mitsubishi_heavy_zj/mitsubishi_heavy_zm/mitsubishi_heavy_zmp/mitsubishi_kj/mitsubishi_msc/mitsubishi_msy/mitsubishi_sez/panasonic_ckp/panasonic_dke/panasonic_eke/panasonic_jke/panasonic_lke/panasonic_nke/samsung_aqv/samsung_fjm/sharp/toshiba_daiseikai/toshiba/zhlt01/nibe/qlima_1/qlima_2/samsung_aqv12msan/zhjg01/airway/bgh_aud/panasonic_altdke/philco_phs32/vaillantvai8/r51m",
             PropertyList({
-                Property("protocol", kPropertyTypeString, std::string("gree"))
+                Property("protocol", kPropertyTypeString, std::string(""))
             }),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string protocol = properties["protocol"].value<std::string>();
+                if (protocol.empty()) {
+                    return "{\"success\": false, \"message\": \"未提供空调品牌 protocol, 请先询问用户空调品牌后再调用本工具\"}";
+                }
                 auto proto = heatpump_ir_tx::protocol_from_string(protocol.c_str());
                 esp_err_t err = climate_.set_protocol(proto);
                 if (err != ESP_OK) {
@@ -317,7 +336,7 @@ private:
             });
 
         mcp_server.AddTool("self.ac.set",
-            "设置空调状态并通过红外发送控制信号。protocol 可空(使用已设置的空调品牌)或直接指定品牌; 若从未设置过品牌, 本工具会拒绝发送并提示先调用 self.ac.set_protocol 告知品牌。mode: off/cool/heat/auto/fan/dry; temperature: 16-30; fan: auto/low/medium/high; swing: off/horizontal/vertical/both",
+            "设置空调状态并通过红外发送控制信号。protocol 可空(使用已设置的空调品牌)或直接指定品牌; 若从未设置过品牌, 本工具会拒绝发送并提示先调用 self.ac.set_protocol 告知品牌。mode: off/cool/heat/auto/fan/dry; 重要: 用户要求'打开/开启空调'时, 必须传开机模式(如 cool/heat/auto/fan), 绝不能因为 self.ac.get 返回的当前状态是 off 就发送 off(off 只在用户明确说'关闭/关机'时才传); temperature: 16-30; fan: auto/low/medium/high; swing: off/horizontal/vertical/both",
             PropertyList({
                 Property("protocol", kPropertyTypeString, std::string("")),
                 Property("mode", kPropertyTypeString, std::string("cool")),
@@ -390,6 +409,9 @@ private:
                 }
 
                 esp_err_t err = climate_.transmit_state();
+                ESP_LOGI("WIFI-REMOTE-COMPANION", "self.ac.set => protocol=%s mode=%s temp=%d fan=%s swing=%s, transmit=%s",
+                         protocol.c_str(), mode.c_str(), properties["temperature"].value<int>(),
+                         fan.c_str(), swing.c_str(), esp_err_to_name(err));
                 if (err != ESP_OK) {
                     char resp[128];
                     snprintf(resp, sizeof(resp), "{\"success\": false, \"message\": \"transmit failed: %s\"}", esp_err_to_name(err));
@@ -421,6 +443,19 @@ private:
                 return std::string(resp);
             });
 
+        mcp_server.AddTool("self.ac.reset",
+            "清除已保存的空调品牌协议和当前空调状态(清空 NVS 中的品牌记录, 释放协议对象)。"
+            "调用后 self.ac.set 将拒绝发送直到再次通过 self.ac.set_protocol 设置品牌。"
+            "当用户说'清除空调数据/重新设置空调'时应调用本工具",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                ClearACProtocolFromNVS();
+                climate_.reset();                     // 释放当前协议对象
+                ac_protocol_name_ = "";               // 清空当前品牌
+                ac_protocol_configured_ = false;      // 标记未配置
+                return "{\"success\": true, \"message\": \"空调品牌协议和状态已清除\"}";
+            });
+
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
             "开始红外学习。preset 可选 air_conditioner(空调)/tv(电视)/custom(自定义, 默认); custom 时用 keys 指定逗号分隔的按键名列表, 如 \"电源,模式,温度+,温度-\"。学习过程中请按提示依次用遥控器对准接收头按键",
@@ -434,12 +469,12 @@ private:
                 }
                 std::string preset = properties["preset"].value<std::string>();
                 if (preset == "air_conditioner") {
-                    EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
+                    // EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                     ir_learner_->learnAirConditioner();  // 内部会 reset + 添加空调按键 + startLearning
                     return "{\"success\": true, \"message\": \"开始学习空调按键: 电源/模式/温度+/温度-/风速/上下扫风/左右扫风/定时\"}";
                 }
                 if (preset == "tv") {
-                    EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
+                    // EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                     ir_learner_->learnTV();  // 内部会 reset + 添加电视按键 + startLearning
                     return "{\"success\": true, \"message\": \"开始学习电视按键: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单\"}";
                 }
@@ -465,7 +500,7 @@ private:
                 if (ir_learner_->getKeys().empty()) {
                     return "{\"success\": false, \"message\": \"no keys specified\"}";
                 }
-                EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
+                // EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                 ir_learner_->startLearning();
                 return "{\"success\": true, \"message\": \"开始学习, 请按提示依次按键\"}";
             });
@@ -504,7 +539,7 @@ private:
                     return "{\"success\": false, \"message\": \"index out of range\"}";
                 }
                 ir_learner_->playKey(index);
-                EnsureIRLoopTask();  // 回放需要 ir_loop 任务执行实际发送
+                // EnsureIRLoopTask();  // 回放需要 ir_loop 任务执行实际发送
                 char resp[256];
                 snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"playing [%s]\", \"index\": %d}",
                          keys[index].name.c_str(), index);
@@ -623,7 +658,7 @@ public:
 
     virtual AudioCodec* GetAudioCodec() override
     {
-        if (mix_audio_codec_ == nullptr) {
+        // if (mix_audio_codec_ == nullptr) {
             static AdcPdmAudioCodec audio_codec(
                 AUDIO_INPUT_SAMPLE_RATE,
                 AUDIO_OUTPUT_SAMPLE_RATE,
@@ -631,9 +666,10 @@ public:
                 AUDIO_PDM_SPEAK_P_GPIO,
                 AUDIO_PDM_SPEAK_N_GPIO,
                 AUDIO_PA_CTL_GPIO);
-            mix_audio_codec_ = new MixAudioCodec(&audio_codec);
-        }
-        return mix_audio_codec_;
+            return &audio_codec;
+        //     mix_audio_codec_ = new MixAudioCodec(&audio_codec);
+        // }
+        // return mix_audio_codec_;
     }
 
     // 无屏幕板卡：不重写 GetDisplay()，使用基类默认的 NoDisplay
