@@ -185,4 +185,11 @@ class HeatPumpClimate {
   void release_protocol_();
 };
 
+// 将协议名字符串(小写, ESPHome 风格, 如 "gree"/"daikin"/"midea"/"panasonic_lke")
+// 映射为 Protocol; 未知名称回退到默认协议 PANASONIC_LKE。
+Protocol protocol_from_string(const char* name);
+
+// Protocol -> 规范协议名字符串(供上层查询当前品牌, 如 self.ac.get)。
+const char* protocol_to_string(Protocol protocol);
+
 }  // namespace heatpump_ir_tx

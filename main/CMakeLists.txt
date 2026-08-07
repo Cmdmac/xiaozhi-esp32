@@ -833,7 +833,7 @@ else()
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
 
-# wifi-remote-companion (WiFi遥控伴侣): 红外遥控子模块 (纯学习模式, 不编译空调协议库)
+# wifi-remote-companion (WiFi遥控伴侣): 红外遥控子模块 (学习 + 全协议空调控制)
 # 顶层 glob 只收集 *.cc/*.c, 这里显式加入子目录中的红外发射/学习源文件
 if(CONFIG_BOARD_TYPE_WIFI_REMOTE_COMPANION)
     list(APPEND SOURCES
@@ -841,15 +841,22 @@ if(CONFIG_BOARD_TYPE_WIFI_REMOTE_COMPANION)
         "boards/wifi-remote-companion/learner/irremote8266/IRrecv.cpp"
         "boards/wifi-remote-companion/learner/irremote8266/IRutils.cpp"
         "boards/wifi-remote-companion/learner/irremote8266/IRtext.cpp"
-        # IRSender 基类实现(IRLearner 的 IRSenderRMT 桥接需要其构造/虚函数; 不含空调协议库)
-        "boards/wifi-remote-companion/ac/heatpumpir/IRSender.cpp"
+        # 空调控制 (全协议): climate 桥接 + heatpumpir 协议库
+        "boards/wifi-remote-companion/ac/heatpump_climate.cpp"
     )
+    # heatpumpir 库: 编译全部协议源文件(含 IRSender.cpp/HeatpumpIR.cpp),
+    # 排除各硬件发送器实现(我们使用自带的 IRSenderIDF 桥接)与库自带的工厂
+    file(GLOB HEATPUMPIR_PROTO_SRCS
+        "boards/wifi-remote-companion/ac/heatpumpir/*.cpp"
+    )
+    list(FILTER HEATPUMPIR_PROTO_SRCS EXCLUDE REGEX
+        ".*/(IRSenderBitBang|IRSenderBlaster|IRSenderESP32|IRSenderESP8266|IRSenderESP8266Alt|IRSenderIRremoteESP8266|IRSenderPWM|HeatpumpIRFactory)\\.cpp$")
+    list(APPEND SOURCES ${HEATPUMPIR_PROTO_SRCS})
     list(APPEND INCLUDE_DIRS
         "boards/wifi-remote-companion"
         "boards/wifi-remote-companion/remote_transmitter"
         "boards/wifi-remote-companion/learner/include"
         "boards/wifi-remote-companion/learner/irremote8266"
-        # IRLearner 依赖 heatpumpir 的 IRSender.h/HeatpumpIRCompat.h 头文件(仅头文件, 不编译其源文件)
         "boards/wifi-remote-companion/ac"
         "boards/wifi-remote-companion/ac/heatpumpir"
     )

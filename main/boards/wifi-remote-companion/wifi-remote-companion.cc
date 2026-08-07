@@ -12,8 +12,11 @@
 
 #include "nvs_flash.h"
 
-// ===== IR 遥控伴侣模块 (纯学习模式) =====
+// ===== IR 遥控伴侣模块 (学习 + 全协议空调控制) =====
+// 注意: heatpump_climate.h 必须先于 IRLearner.h 包含——IRLearner.h 通过
+// Arduino 兼容层会定义 LOW/HIGH 宏, 会破坏 heatpump_climate.h 中的枚举声明
 #include <remote_transmitter.h>
+#include <heatpump_climate.h>
 #include <IRLearner.h>
 
 // HeatpumpIRCompat.h 定义的 LOW/HIGH 宏与代码中其它枚举值同名, 取消定义
@@ -29,9 +32,11 @@
 // 学习结果 NVS 持久化
 #define IR_NVS_NAMESPACE "ir_keys"
 #define IR_NVS_KEY       "learned"
+#define IR_NVS_AC_PROTOCOL_KEY "ac_protocol"
 
 using heatpump_ir_tx::RemoteTransmitter;
 using heatpump_ir_tx::RemoteTransmitData;
+using heatpump_ir_tx::HeatPumpClimate;
 
 class WifiRemoteCompanion : public WifiBoard {
 private:
@@ -42,6 +47,9 @@ private:
 
     // 红外遥控硬件
     RemoteTransmitter ir_tx_;
+    HeatPumpClimate climate_;
+    std::string ac_protocol_name_{"panasonic_lke"};  // 当前空调品牌协议名
+    bool ac_protocol_configured_ = false;            // 是否已显式设置过品牌(NVS/set_protocol)
     IRLearner* ir_learner_ = nullptr;
     TaskHandle_t ir_task_ = nullptr;
 
@@ -81,6 +89,33 @@ private:
         } else {
             vTaskResume(ir_task_);
         }
+    }
+
+    // ===== 空调品牌协议持久化 =====
+    void SaveACProtocolToNVS(const std::string& name) {
+        nvs_handle_t h;
+        if (nvs_open(IR_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+        esp_err_t err = nvs_set_str(h, IR_NVS_AC_PROTOCOL_KEY, name.c_str());
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "空调品牌协议已保存: %s", name.c_str());
+        } else {
+            ESP_LOGE(TAG, "保存空调品牌协议失败: %s", esp_err_to_name(err));
+        }
+    }
+
+    std::string LoadACProtocolFromNVS() {
+        nvs_handle_t h;
+        if (nvs_open(IR_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+            return "";
+        }
+        char buf[32] = {0};
+        size_t len = sizeof(buf);
+        esp_err_t err = nvs_get_str(h, IR_NVS_AC_PROTOCOL_KEY, buf, &len);
+        nvs_close(h);
+        if (err != ESP_OK) return "";
+        return std::string(buf);
     }
 
     // ===== 学习结果 NVS 持久化 =====
@@ -213,6 +248,25 @@ private:
         }
         ir_tx_.set_carrier_duty_percent(33);
 
+        // 空调控制: 默认协议 Panasonic LKE, 可通过 self.ac.set/set_protocol 切换品牌并持久化
+        esp_err_t cerr = climate_.begin(&ir_tx_, heatpump_ir_tx::Protocol::PANASONIC_LKE);
+        if (cerr != ESP_OK) {
+            ESP_LOGE(TAG, "AC climate begin failed: %s", esp_err_to_name(cerr));
+        }
+        climate_.set_min_temperature(16.0f);
+        climate_.set_max_temperature(30.0f);
+
+        // 开机恢复上次保存的空调品牌协议
+        std::string saved_proto = LoadACProtocolFromNVS();
+        if (!saved_proto.empty()) {
+            auto proto = heatpump_ir_tx::protocol_from_string(saved_proto.c_str());
+            if (climate_.set_protocol(proto) == ESP_OK) {
+                ac_protocol_name_ = heatpump_ir_tx::protocol_to_string(proto);
+                ac_protocol_configured_ = true;  // 持久化过的品牌同样视为已配置
+                ESP_LOGI(TAG, "空调品牌协议(已保存): %s", ac_protocol_name_.c_str());
+            }
+        }
+
         // 红外学习: 接收用 GPIO 中断, 回放共用 RMT 发射器
         ir_learner_ = new IRLearner(IR_RX_GPIO, IR_TX_GPIO);
         ir_learner_->setup();
@@ -238,6 +292,134 @@ private:
 
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
+
+        // ========== 空调控制 (全协议) ==========
+        mcp_server.AddTool("self.ac.set_protocol",
+            "设置并记住空调品牌协议(保存到 NVS, 之后 self.ac.set 无需再传 protocol)。protocol 可选: aux/ballu/carrier_mca/carrier_nqv/daikin_arc417/daikin_arc480/daikin/electroluxyal/fuego/fujitsu/gree/greeyaa/greeyan/greeyac/greeyt/greeyap/hisense_aud/hitachi/hyundai/ivt/midea/mitsubishi_fa/mitsubishi_fd/mitsubishi_fe/mitsubishi_heavy_fdtc/mitsubishi_heavy_zj/mitsubishi_heavy_zm/mitsubishi_heavy_zmp/mitsubishi_kj/mitsubishi_msc/mitsubishi_msy/mitsubishi_sez/panasonic_ckp/panasonic_dke/panasonic_eke/panasonic_jke/panasonic_lke/panasonic_nke/samsung_aqv/samsung_fjm/sharp/toshiba_daiseikai/toshiba/zhlt01/nibe/qlima_1/qlima_2/samsung_aqv12msan/zhjg01/airway/bgh_aud/panasonic_altdke/philco_phs32/vaillantvai8/r51m",
+            PropertyList({
+                Property("protocol", kPropertyTypeString, std::string("gree"))
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string protocol = properties["protocol"].value<std::string>();
+                auto proto = heatpump_ir_tx::protocol_from_string(protocol.c_str());
+                esp_err_t err = climate_.set_protocol(proto);
+                if (err != ESP_OK) {
+                    char resp[160];
+                    snprintf(resp, sizeof(resp), "{\"success\": false, \"message\": \"protocol not supported: %s\"}", protocol.c_str());
+                    return std::string(resp);
+                }
+                ac_protocol_name_ = heatpump_ir_tx::protocol_to_string(proto);
+                ac_protocol_configured_ = true;
+                SaveACProtocolToNVS(ac_protocol_name_);
+                char resp[256];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"空调品牌已设为 %s 并保存\"}", ac_protocol_name_.c_str());
+                return std::string(resp);
+            });
+
+        mcp_server.AddTool("self.ac.set",
+            "设置空调状态并通过红外发送控制信号。protocol 可空(使用已设置的空调品牌)或直接指定品牌; 若从未设置过品牌, 本工具会拒绝发送并提示先调用 self.ac.set_protocol 告知品牌。mode: off/cool/heat/auto/fan/dry; temperature: 16-30; fan: auto/low/medium/high; swing: off/horizontal/vertical/both",
+            PropertyList({
+                Property("protocol", kPropertyTypeString, std::string("")),
+                Property("mode", kPropertyTypeString, std::string("cool")),
+                Property("temperature", kPropertyTypeInteger, 24, 16, 30),
+                Property("fan", kPropertyTypeString, std::string("auto")),
+                Property("swing", kPropertyTypeString, std::string("off"))
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                // 若传入了 protocol 则切换并记住; 否则必须已显式设置过品牌才能发送
+                std::string protocol = properties["protocol"].value<std::string>();
+                if (!protocol.empty()) {
+                    auto proto = heatpump_ir_tx::protocol_from_string(protocol.c_str());
+                    esp_err_t err = climate_.set_protocol(proto);
+                    if (err != ESP_OK) {
+                        char resp[160];
+                        snprintf(resp, sizeof(resp), "{\"success\": false, \"message\": \"protocol not supported: %s\"}", protocol.c_str());
+                        return std::string(resp);
+                    }
+                    ac_protocol_name_ = heatpump_ir_tx::protocol_to_string(proto);
+                    ac_protocol_configured_ = true;
+                    SaveACProtocolToNVS(ac_protocol_name_);
+                } else if (!ac_protocol_configured_) {
+                    // 从未明确设置过空调品牌 → 拒绝盲发, 引导先设置品牌
+                    return "{\"success\": false, \"message\": \"尚未设置空调品牌，请先调用 self.ac.set_protocol 告知空调品牌(如 gree/panasonic_lke/midea/daikin)\"}";
+                } else {
+                    protocol = ac_protocol_name_;
+                }
+
+                std::string mode = properties["mode"].value<std::string>();
+                auto& state = climate_.state();
+
+                if (mode == "off") {
+                    state.mode = heatpump_ir_tx::ClimateMode::OFF;
+                } else if (mode == "cool") {
+                    state.mode = heatpump_ir_tx::ClimateMode::COOL;
+                } else if (mode == "heat") {
+                    state.mode = heatpump_ir_tx::ClimateMode::HEAT;
+                } else if (mode == "auto") {
+                    state.mode = heatpump_ir_tx::ClimateMode::HEAT_COOL;
+                } else if (mode == "fan") {
+                    state.mode = heatpump_ir_tx::ClimateMode::FAN_ONLY;
+                } else if (mode == "dry") {
+                    state.mode = heatpump_ir_tx::ClimateMode::DRY;
+                } else {
+                    return "{\"success\": false, \"message\": \"invalid mode, use off/cool/heat/auto/fan/dry\"}";
+                }
+
+                state.target_temperature = static_cast<float>(properties["temperature"].value<int>());
+
+                std::string fan = properties["fan"].value<std::string>();
+                if (fan == "low") {
+                    state.fan = heatpump_ir_tx::ClimateFanMode::LOW;
+                } else if (fan == "medium") {
+                    state.fan = heatpump_ir_tx::ClimateFanMode::MEDIUM;
+                } else if (fan == "high") {
+                    state.fan = heatpump_ir_tx::ClimateFanMode::HIGH;
+                } else {
+                    state.fan = heatpump_ir_tx::ClimateFanMode::AUTO;
+                }
+
+                std::string swing = properties["swing"].value<std::string>();
+                if (swing == "horizontal") {
+                    state.swing = heatpump_ir_tx::ClimateSwingMode::HORIZONTAL;
+                } else if (swing == "vertical") {
+                    state.swing = heatpump_ir_tx::ClimateSwingMode::VERTICAL;
+                } else if (swing == "both") {
+                    state.swing = heatpump_ir_tx::ClimateSwingMode::BOTH;
+                } else {
+                    state.swing = heatpump_ir_tx::ClimateSwingMode::OFF;
+                }
+
+                esp_err_t err = climate_.transmit_state();
+                if (err != ESP_OK) {
+                    char resp[128];
+                    snprintf(resp, sizeof(resp), "{\"success\": false, \"message\": \"transmit failed: %s\"}", esp_err_to_name(err));
+                    return std::string(resp);
+                }
+                char resp[320];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"AC sent: protocol=%s mode=%s temp=%d fan=%s swing=%s\"}",
+                         protocol.c_str(), mode.c_str(), properties["temperature"].value<int>(), fan.c_str(), swing.c_str());
+                return std::string(resp);
+            });
+
+        mcp_server.AddTool("self.ac.get",
+            "获取当前空调状态(品牌协议/温度/模式)",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                auto& s = climate_.state();
+                const char* mode = "off";
+                switch (s.mode) {
+                    case heatpump_ir_tx::ClimateMode::COOL: mode = "cool"; break;
+                    case heatpump_ir_tx::ClimateMode::HEAT: mode = "heat"; break;
+                    case heatpump_ir_tx::ClimateMode::HEAT_COOL: mode = "auto"; break;
+                    case heatpump_ir_tx::ClimateMode::FAN_ONLY: mode = "fan"; break;
+                    case heatpump_ir_tx::ClimateMode::DRY: mode = "dry"; break;
+                    default: mode = "off"; break;
+                }
+                char resp[320];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"protocol\": \"%s\", \"mode\": \"%s\", \"temperature\": %d}",
+                         ac_protocol_name_.c_str(), mode, (int)s.target_temperature);
+                return std::string(resp);
+            });
 
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
