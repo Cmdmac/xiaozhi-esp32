@@ -339,7 +339,7 @@ private:
             });
 
         mcp_server.AddTool("self.ac.set",
-            "设置空调状态并通过红外发送控制信号。protocol 可空(使用已设置的空调品牌)或直接指定品牌; 若从未设置过品牌, 本工具会拒绝发送并提示先调用 self.ac.set_protocol 告知品牌。mode: off/cool/heat/auto/fan/dry; 重要: 用户要求'打开/开启空调'时, 必须传开机模式(如 cool/heat/auto/fan), 绝不能因为 self.ac.get 返回的当前状态是 off 就发送 off(off 只在用户明确说'关闭/关机'时才传); temperature: 16-30; fan: auto/low/medium/high; swing: off/horizontal/vertical/both",
+            "设置空调状态并通过红外发送控制信号。protocol 可空: 未传 protocol 时优先使用本地学习到的红外码发送(开机/关机→[电源]键, 切换模式→[模式]键, 调高/调低温度→[温度+]/[温度-]键); 本地没有学习码时, 再使用已设置的品牌协议, 若品牌也未设置则提示先调用 self.ac.set_protocol。protocol 也可直接指定品牌。mode: off/cool/heat/auto/fan/dry; 重要: 用户要求'打开/开启空调'时, 必须传开机模式(如 cool/heat/auto/fan), 绝不能因为 self.ac.get 返回的当前状态是 off 就发送 off(off 只在用户明确说'关闭/关机'时才传); temperature: 16-30; fan: auto/low/medium/high; swing: off/horizontal/vertical/both",
             PropertyList({
                 Property("protocol", kPropertyTypeString, std::string("")),
                 Property("mode", kPropertyTypeString, std::string("cool")),
@@ -348,9 +348,31 @@ private:
                 Property("swing", kPropertyTypeString, std::string("off"))
             }),
             [this](const PropertyList& properties) -> ReturnValue {
-                // 若传入了 protocol 则切换并记住; 否则必须已显式设置过品牌才能发送
+                std::string mode = properties["mode"].value<std::string>();
+                auto& state = climate_.state();
+                int target_temp = properties["temperature"].value<int>();
+
+                // 解析 mode → 协议枚举
+                heatpump_ir_tx::ClimateMode want_mode;
+                if (mode == "off") {
+                    want_mode = heatpump_ir_tx::ClimateMode::OFF;
+                } else if (mode == "cool") {
+                    want_mode = heatpump_ir_tx::ClimateMode::COOL;
+                } else if (mode == "heat") {
+                    want_mode = heatpump_ir_tx::ClimateMode::HEAT;
+                } else if (mode == "auto") {
+                    want_mode = heatpump_ir_tx::ClimateMode::HEAT_COOL;
+                } else if (mode == "fan") {
+                    want_mode = heatpump_ir_tx::ClimateMode::FAN_ONLY;
+                } else if (mode == "dry") {
+                    want_mode = heatpump_ir_tx::ClimateMode::DRY;
+                } else {
+                    return "{\"success\": false, \"message\": \"invalid mode, use off/cool/heat/auto/fan/dry\"}";
+                }
+
                 std::string protocol = properties["protocol"].value<std::string>();
                 if (!protocol.empty()) {
+                    // 指定了品牌 → 切换并记住
                     auto proto = heatpump_ir_tx::protocol_from_string(protocol.c_str());
                     esp_err_t err = climate_.set_protocol(proto);
                     if (err != ESP_OK) {
@@ -361,33 +383,62 @@ private:
                     ac_protocol_name_ = heatpump_ir_tx::protocol_to_string(proto);
                     ac_protocol_configured_ = true;
                     SaveACProtocolToNVS(ac_protocol_name_);
-                } else if (!ac_protocol_configured_) {
-                    // 从未明确设置过空调品牌 → 拒绝盲发, 引导先设置品牌
-                    return "{\"success\": false, \"message\": \"尚未设置空调品牌，请先调用 self.ac.set_protocol 告知空调品牌(如 gree/panasonic_lke/midea/daikin)\"}";
+                } else if (ir_learner_) {
+                    // 没传 protocol → 优先使用本地学习码(用户学习过的红外按键)
+                    // 指令 → 学习键 映射(按优先级)
+                    std::vector<std::string> candidates;
+                    if (mode == "off") {
+                        candidates.push_back("电源");  // 关机 → 电源键
+                    } else {
+                        candidates.push_back("电源");  // 开机 → 电源键
+                        if (state.mode != heatpump_ir_tx::ClimateMode::OFF &&
+                            state.mode != want_mode) {
+                            candidates.push_back("模式");  // 切换模式 → 模式键
+                        }
+                        if ((int)state.target_temperature != target_temp) {
+                            candidates.push_back(target_temp > (int)state.target_temperature ? "温度+" : "温度-");
+                        }
+                    }
+                    // 按优先级在本地学习键中查找已学习的键
+                    int play_index = -1;
+                    std::string play_name;
+                    auto& keys = ir_learner_->getKeys();
+                    for (const auto& c : candidates) {
+                        for (size_t i = 0; i < keys.size(); i++) {
+                            if (keys[i].isLearned && !keys[i].rawData.empty() &&
+                                keys[i].name == c) {
+                                play_index = (int)i;
+                                play_name = c;
+                                break;
+                            }
+                        }
+                        if (play_index >= 0) break;
+                    }
+                    if (play_index >= 0) {
+                        EnsureIRLoopTask();  // 唤醒 ir_loop 任务执行实际发送(空闲后会自挂起)
+                        ir_learner_->playKey(play_index);
+                        // 记录状态, 供后续温度/模式升降判断
+                        state.mode = want_mode;
+                        state.target_temperature = static_cast<float>(target_temp);
+                        char resp[192];
+                        snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"使用本地学习码发送[%s]键\"}", play_name.c_str());
+                        return std::string(resp);
+                    }
+                    // 本地没有学习码 → 品牌已设置则用品牌, 否则提示设置品牌
+                    if (!ac_protocol_configured_) {
+                        return "{\"success\": false, \"message\": \"尚未设置空调品牌，请先调用 self.ac.set_protocol 告知空调品牌(如 gree/panasonic_lke/midea/daikin)\"}";
+                    }
+                    protocol = ac_protocol_name_;
                 } else {
+                    // 学习者未初始化 → 品牌已设置则用品牌, 否则提示设置品牌
+                    if (!ac_protocol_configured_) {
+                        return "{\"success\": false, \"message\": \"尚未设置空调品牌，请先调用 self.ac.set_protocol 告知空调品牌(如 gree/panasonic_lke/midea/daikin)\"}";
+                    }
                     protocol = ac_protocol_name_;
                 }
 
-                std::string mode = properties["mode"].value<std::string>();
-                auto& state = climate_.state();
-
-                if (mode == "off") {
-                    state.mode = heatpump_ir_tx::ClimateMode::OFF;
-                } else if (mode == "cool") {
-                    state.mode = heatpump_ir_tx::ClimateMode::COOL;
-                } else if (mode == "heat") {
-                    state.mode = heatpump_ir_tx::ClimateMode::HEAT;
-                } else if (mode == "auto") {
-                    state.mode = heatpump_ir_tx::ClimateMode::HEAT_COOL;
-                } else if (mode == "fan") {
-                    state.mode = heatpump_ir_tx::ClimateMode::FAN_ONLY;
-                } else if (mode == "dry") {
-                    state.mode = heatpump_ir_tx::ClimateMode::DRY;
-                } else {
-                    return "{\"success\": false, \"message\": \"invalid mode, use off/cool/heat/auto/fan/dry\"}";
-                }
-
-                state.target_temperature = static_cast<float>(properties["temperature"].value<int>());
+                state.mode = want_mode;
+                state.target_temperature = static_cast<float>(target_temp);
 
                 std::string fan = properties["fan"].value<std::string>();
                 if (fan == "low") {
