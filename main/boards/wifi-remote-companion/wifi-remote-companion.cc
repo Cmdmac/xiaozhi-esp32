@@ -478,7 +478,8 @@ private:
             });
 
         mcp_server.AddTool("self.ac.get",
-            "获取当前空调状态(品牌协议/温度/模式)",
+            "获取当前空调状态和控制来源。返回: protocol(品牌协议名, 未设置时可能为空), mode, temperature, source(控制来源: learned=使用本地学习码, protocol=使用品牌协议), learned_keys(已学习的红外按键列表, 逗号分隔)。"
+            "当用户询问'按键是本地学习的还是内置协议的/当前用哪种方式控制'时, 根据 source 和 learned_keys 如实回答",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 auto& s = climate_.state();
@@ -491,9 +492,28 @@ private:
                     case heatpump_ir_tx::ClimateMode::DRY: mode = "dry"; break;
                     default: mode = "off"; break;
                 }
-                char resp[320];
-                snprintf(resp, sizeof(resp), "{\"success\": true, \"protocol\": \"%s\", \"mode\": \"%s\", \"temperature\": %d}",
-                         ac_protocol_name_.c_str(), mode, (int)s.target_temperature);
+                // 统计本地学习到的按键
+                std::string learned_keys;
+                int learned_count = 0;
+                const char* source = "protocol";  // 控制来源: 本地学习码 or 品牌协议
+                if (ir_learner_) {
+                    auto& keys = ir_learner_->getKeys();
+                    for (auto& k : keys) {
+                        if (k.isLearned && !k.rawData.empty()) {
+                            if (learned_count > 0) learned_keys += ",";
+                            learned_keys += k.name;
+                            learned_count++;
+                            // 本地学过空调相关键(电源/模式/温度±) → 控制来源为学习码
+                            if (k.name == "电源" || k.name == "模式" ||
+                                k.name == "温度+" || k.name == "温度-") {
+                                source = "learned";
+                            }
+                        }
+                    }
+                }
+                char resp[512];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"protocol\": \"%s\", \"mode\": \"%s\", \"temperature\": %d, \"source\": \"%s\", \"learned_keys\": \"%s\"}",
+                         ac_protocol_name_.c_str(), mode, (int)s.target_temperature, source, learned_keys.c_str());
                 return std::string(resp);
             });
 
