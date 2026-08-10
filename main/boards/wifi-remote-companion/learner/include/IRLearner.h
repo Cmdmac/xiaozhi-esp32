@@ -304,8 +304,18 @@ public:
         if (!isSessionActive_ || !receiver_) return;
 
         // 捕获后的等待期: 不再自动推进——由板卡播放"下一个"提示音并模拟回授(上传给服务器),
-        // 模型听到后播报"请按XX键", 板卡随后调用 nextKey() 推进到下一个键
+        // 模型听到后播报"请按XX键", 板卡随后调用 nextKey() 推进到下一个键。
+        // 等待期间用户再按键不应被忽略: 同样回授"下一个"给服务器(板卡会重置推进计时),
+        // 让模型重新语音引导, 避免"按了没反应、模型没回复"
         if (waitingAfterCapture_) {
+            if (receiver_->decode(&results_)) {
+                uint16_t rawlen = results_.rawlen;
+                if (rawlen >= 5) {
+                    ESP_LOGI(TAG, "等待推进期间按键 (rawlen=%d), 重新回授'下一个'", rawlen);
+                    if (on_key_captured_) on_key_captured_();
+                }
+                receiver_->resume();  // 清除接收缓冲, 防止同一信号重复触发
+            }
             return;
         }
         if (receiver_->decode(&results_)) {

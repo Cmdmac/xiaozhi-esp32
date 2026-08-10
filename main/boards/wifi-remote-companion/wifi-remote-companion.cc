@@ -150,16 +150,34 @@ private:
     esp_timer_handle_t unmute_timer_ = nullptr;
     static constexpr uint32_t UNMUTE_DELAY_MS = 2500;  // > "学习完成"提示音(~1.7s) + 余量
 
-    // 捕获按键后延时推进到下一个键: "下一个"提示音播放并模拟回授(上传给服务器)后,
-    // 留时间给 ASR 识别与模型播报, 再进入下一个键学习
+    // 捕获按键后由模型语音驱动推进到下一个键: 不再用固定倒计时盲推,
+    // 而是检测模型对"下一个"的语音回复(TTS)播完(speaking -> 非 speaking)后再 nextKey()。
+    // 状态机: kWaitingCurrent(捕获时模型还在播上一个回复, 先等它播完) ->
+    //         kWaitingReply(等模型开始回复"下一个") -> kReplyPlaying(回复播放中) -> 播完推进
     esp_timer_handle_t next_timer_ = nullptr;
-    static constexpr uint32_t NEXT_DELAY_MS = 4000;
+    enum class NextAdvanceState { kWaitingCurrent, kWaitingReply, kReplyPlaying };
+    NextAdvanceState advance_state_ = NextAdvanceState::kWaitingCurrent;
+    int64_t capture_time_us_ = 0;   // 本次捕获时间戳, 用于兜底超时
+    int64_t waiting_reply_since_us_ = 0;  // 进入"等待模型回复"的时间戳, 用于超时重发
+    static constexpr uint32_t MODEL_CHECK_MS = 300;            // 状态轮询间隔
+    static constexpr uint32_t MODEL_REPLY_TIMEOUT_MS = 10000;  // 模型始终没回复时的兜底超时
+    static constexpr uint32_t MODEL_RETRY_MS = 3000;           // 模型迟迟没回复时重发"下一个"
 
     // 学习结束后延迟保存到 NVS 的倒计时 (ir_loop 每 20ms 递减):
     // "学习完成"提示音(约1.7s)刚投递播放, NVS flash 写入会阻塞单核 CPU,
     // 与播放重叠会听到卡顿, 故等提示音播完再保存
     int save_delay_ticks_ = 0;
     static constexpr int SAVE_DELAY_TICKS = 100;  // 100 * 20ms = 2s, 覆盖提示音时长+余量
+
+    // 把"下一个"提示音直接发送到小智服务端音频通道, 服务器 ASR 识别出"下一个",
+    // 模型因此"听到"并语音回复引导(如"好的, 请按模式键"); 本地不播放"下一个"人声,
+    // 只有 popup 短音效作为按键反馈(在按键捕获时立即播放)
+    void SendNextOggToServer() {
+        const auto& ogg = Lang::Sounds::OGG_IR_NEXT;
+        // 零拷贝直传嵌入资源(静态), 避免模型 TTS 播放期间堆内存紧张时拷贝分配失败崩溃
+        Application::GetInstance().SendOggToServer(
+            reinterpret_cast<const uint8_t*>(ogg.data()), ogg.size());
+    }
 
     static void UnmuteTimerCallback(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
@@ -171,9 +189,46 @@ private:
 
     static void NextTimerCallback(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
-        if (self->ir_learner_) {
-            self->ir_learner_->nextKey();
+        if (!self->ir_learner_) return;
+        auto state = Application::GetInstance().GetDeviceState();
+        switch (self->advance_state_) {
+            case NextAdvanceState::kWaitingCurrent:
+                // 捕获时模型还在播上一个回复, 等它播完(回到非 speaking)再发送"下一个":
+                // 设备 TTS 播放期间服务器可能不处理上行音频, 等播完再发 ASR 识别率更高
+                if (state != kDeviceStateSpeaking) {
+                    self->advance_state_ = NextAdvanceState::kWaitingReply;
+                    self->waiting_reply_since_us_ = esp_timer_get_time();
+                    self->SendNextOggToServer();
+                }
+                break;
+            case NextAdvanceState::kWaitingReply:
+                // 模型开始回复"下一个"(进入 speaking)
+                if (state == kDeviceStateSpeaking) {
+                    self->advance_state_ = NextAdvanceState::kReplyPlaying;
+                } else if (esp_timer_get_time() - self->waiting_reply_since_us_ > (int64_t)MODEL_RETRY_MS * 1000) {
+                    // 模型迟迟没开始回复(ASR 偶发识别失败): 重发"下一个"补救, 并重新计时
+                    self->waiting_reply_since_us_ = esp_timer_get_time();
+                    ESP_LOGW(TAG, "模型迟迟未回复, 重发'下一个'给服务器");
+                    self->SendNextOggToServer();
+                }
+                break;
+            case NextAdvanceState::kReplyPlaying:
+                // 模型语音回复播完(回到非 speaking) → 由模型驱动推进下一个键
+                if (state != kDeviceStateSpeaking) {
+                    self->advance_state_ = NextAdvanceState::kWaitingCurrent;
+                    self->ir_learner_->nextKey();
+                    return;  // 推进完成, 不再重启 timer
+                }
+                break;
         }
+        // 兜底: 模型始终没回复(如 ASR 识别失败), 超时后强制推进, 防止卡死
+        if (esp_timer_get_time() - self->capture_time_us_ > (int64_t)MODEL_REPLY_TIMEOUT_MS * 1000) {
+            ESP_LOGW(TAG, "模型未回复, 超时兜底推进到下一个键");
+            self->advance_state_ = NextAdvanceState::kWaitingCurrent;
+            self->ir_learner_->nextKey();
+            return;
+        }
+        esp_timer_start_once(self->next_timer_, MODEL_CHECK_MS * 1000);
     }
 
     static void IRLoopTask(void* arg) {
@@ -422,10 +477,7 @@ private:
         // 本地播放 popup 短音效作为按键反馈(确认用户按键已被捕获), 不播放"下一个"人声,
         // 引导用户按哪个键仍由模型语音负责, 不播放 ic_ac 那类"请按XX键"提示音
         ir_learner_->setOnKeyCaptured([this]() {
-            const auto& ogg = Lang::Sounds::OGG_IR_NEXT;
-            // 直发方案(当前): 把"下一个"ogg 拆成 opus 帧经小智主协议上行, 供服务器 ASR 识别
-            Application::GetInstance().SendOggToServer(std::vector<uint8_t>(ogg.begin(), ogg.end()));
-            // 本地播放 popup 短音效作为按键反馈提示音
+            // 本地播放 popup 短音效作为按键反馈提示音(立即响应, 确认按键已被捕获)
             Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
 
             // 以下为模拟回授方案(已弃用, 保留备查): 解码 ogg 得到 48kHz PCM, 注入 codec 模拟麦克风。
@@ -474,17 +526,28 @@ private:
 
             // 解除模型 TTS 抑制: 让模型对"下一个"的回复(如"好的, 请按模式键")可以播报出来
             Application::GetInstance().SetSuppressNetworkAudio(false);
-            // 留时间给上传+ASR识别+模型播报, 延时后推进到下一个键
+            // 启动"模型语音驱动推进"检查: 每次按键都从捕获时刻重新计时/复位状态机。
+            // 模型 TTS 还在播放时(设备 speaking)不立即直发"下一个": 设备 TTS 播放期间服务器
+            // 可能不处理上行音频, ASR 识别率低; 等当前回复播完(kWaitingCurrent -> kWaitingReply)再发。
+            capture_time_us_ = esp_timer_get_time();
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+                advance_state_ = NextAdvanceState::kWaitingCurrent;
+            } else {
+                advance_state_ = NextAdvanceState::kWaitingReply;
+                waiting_reply_since_us_ = esp_timer_get_time();
+                SendNextOggToServer();
+            }
             if (next_timer_) {
                 esp_timer_stop(next_timer_);
-                esp_timer_start_once(next_timer_, NEXT_DELAY_MS * 1000);
+                esp_timer_start_once(next_timer_, MODEL_CHECK_MS * 1000);
             }
         });
         // 学习全部完成: 不再本地播放"学习完成"提示音, 直发"下一个"给服务端,
         // 模型收到后语音总结学习结果(如"所有按键已学习完成")
         ir_learner_->setOnLearningCompleted([]() {
             const auto& ogg = Lang::Sounds::OGG_IR_NEXT;
-            Application::GetInstance().SendOggToServer(std::vector<uint8_t>(ogg.begin(), ogg.end()));
+            Application::GetInstance().SendOggToServer(
+                reinterpret_cast<const uint8_t*>(ogg.data()), ogg.size());
         });
         // 提示用户按某个键时播放对应按键的语音提示(学习空调时依次播报"请按电源键/模式键/温度+/温度-")。
         // 提示音为 48kHz, 与 TTS 采样率一致, 不会触发解码器反复重建
@@ -539,6 +602,7 @@ private:
                 if (next_timer_) {
                     esp_timer_stop(next_timer_);
                 }
+                advance_state_ = NextAdvanceState::kWaitingCurrent;
                 codec->SetInputMuted(true);
             } else {
                 // 学习结束: 延迟恢复麦克风, 等完成提示音播放完毕再解除静音

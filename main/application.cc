@@ -1212,31 +1212,37 @@ void Application::SendMcpMessage(const std::string& payload) {
     });
 }
 
-void Application::SendOggToServer(const std::vector<uint8_t>& ogg) {
-    // protocol_ 只能由主任务访问, 拆帧/入队/发送全部在 Schedule 回调中完成
-    Schedule([this, ogg]() {
+void Application::SendOggToServer(const uint8_t* data, size_t size) {
+    // protocol_ 只能由主任务访问, 拆帧/入队/发送全部在 Schedule 回调中完成。
+    // 不拷贝 ogg 数据: data/size 指向静态嵌入资源, 生命周期与应用相同。
+    // 模型 TTS 播放期间堆内存紧张, 拷贝分配可能失败抛 bad_alloc 导致 __terminate 崩溃,
+    // 因此零拷贝 + try-catch 兜底, 保证发送失败只会丢一帧/一次发送, 不会崩
+    Schedule([this, data, size]() {
         if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
             ESP_LOGW(TAG, "Audio channel not opened, skip sending ogg to server");
             return;
         }
-        // 用 OggDemuxer 拆出每个独立 opus 压缩包(与 PlaySound 相同的解析路径)。
-        // 注意不能用 OggParser 攒帧拼包的方式: 它把 3 个 opus 压缩帧拼成一个 buffer 发送,
-        // 服务器解码器无法识别拼接帧, ASR 会识别失败
-        std::vector<std::vector<uint8_t>> frames;
-        auto demuxer = std::make_unique<OggDemuxer>();
-        demuxer->OnDemuxerFinished([&frames](const uint8_t* data, int sample_rate, size_t size) {
-            frames.emplace_back(data, data + size);
-        });
-        demuxer->Reset();
-        demuxer->Process(ogg.data(), ogg.size());
-        ESP_LOGI(TAG, "Send %d opus frames to server", (int)frames.size());
-        // 逐个入队后立即消费发送, 不依赖状态机在状态切换时才消费 openclaw 队列
-        for (auto& frame : frames) {
-            audio_service_.PushTaskToOpenClawSendQueue(frame);
+        // 逐帧拆解+发送: 每次只占用一帧 opus 压缩包的小内存, 避免把所有帧一次性分配出来。
+        // 模型 TTS 播放时堆内存紧张, 一次性分配 40+ 帧再发送会触发 AES 加密内存分配失败
+        // (esp-aes: Failed to allocate memory / errno=12)
+        int sent = 0;
+        try {
+            auto demuxer = std::make_unique<OggDemuxer>();
+            demuxer->OnDemuxerFinished([this, &sent](const uint8_t* pkt, int sample_rate, size_t pkt_size) {
+                audio_service_.PushTaskToOpenClawSendQueue(std::vector<uint8_t>(pkt, pkt + pkt_size));
+                while (auto packet = audio_service_.PopFromOpenClawSendQueue()) {
+                    if (!protocol_->SendAudio(std::move(packet))) {
+                        return;  // 单帧发送失败(如内存不足), 丢弃该帧后继续后续帧
+                    }
+                    sent++;
+                }
+            });
+            demuxer->Reset();
+            demuxer->Process(data, size);
+        } catch (const std::exception& e) {
+            ESP_LOGE(TAG, "SendOggToServer exception: %s", e.what());
         }
-        while (auto packet = audio_service_.PopFromOpenClawSendQueue()) {
-            protocol_->SendAudio(std::move(packet));
-        }
+        ESP_LOGI(TAG, "Send %d opus frames to server", sent);
     });
 }
 

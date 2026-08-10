@@ -113,16 +113,17 @@ public:
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
-    /**
-     * 把本地 ogg(opus 压缩帧) 直接发送到小智服务端音频通道, 供服务器 ASR 识别。
-     * 在主任务中执行, 线程安全; 用于把"下一个"等本地提示音上行给模型,
-     * 例如红外学习按键捕获后让模型"听到"提示并语音回复。
-     */
-    void SendOggToServer(const std::vector<uint8_t>& ogg);
     // 抑制服务器下发的模型 TTS 音频(不入播放队列), 本地 PlaySound 提示音不受影响。
     // 用于红外学习等场景: 学习期间设备会播放本地按键提示音, 模型的多余回复(如"好的")会与提示音重叠
     void SetSuppressNetworkAudio(bool suppress);
     AudioService& GetAudioService() { return audio_service_; }
+
+    /**
+     * 把一段 OGG(Opus) 音频拆成 opus 帧直接发送到小智服务端音频通道, 供服务器 ASR 识别。
+     * data/size 指向静态嵌入资源(生命周期与应用相同), 不拷贝——避免模型 TTS 播放期间
+     * 堆内存紧张时拷贝分配失败抛 bad_alloc 导致崩溃
+     */
+    void SendOggToServer(const uint8_t* data, size_t size);
     
     void WakeUpFromOpenClaw();
     OpenClawWebSocket& GetOpenClawWebSocket() { return *openclaw_websocket_; }
