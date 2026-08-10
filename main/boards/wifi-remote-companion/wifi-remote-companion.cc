@@ -480,9 +480,11 @@ private:
                 esp_timer_start_once(next_timer_, NEXT_DELAY_MS * 1000);
             }
         });
-        // 学习全部完成时播放"学习完成"语音提示 (本地人声, 不依赖模型/网络)
+        // 学习全部完成: 不再本地播放"学习完成"提示音, 直发"下一个"给服务端,
+        // 模型收到后语音总结学习结果(如"所有按键已学习完成")
         ir_learner_->setOnLearningCompleted([]() {
-            Application::GetInstance().PlaySound(Lang::Sounds::OGG_IR_LEARN_DONE);
+            const auto& ogg = Lang::Sounds::OGG_IR_NEXT;
+            Application::GetInstance().SendOggToServer(std::vector<uint8_t>(ogg.begin(), ogg.end()));
         });
         // 提示用户按某个键时播放对应按键的语音提示(学习空调时依次播报"请按电源键/模式键/温度+/温度-")。
         // 提示音为 48kHz, 与 TTS 采样率一致, 不会触发解码器反复重建
@@ -786,12 +788,11 @@ private:
 
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
-            "当用户说'学习空调/学习遥控器/学习按键/开始学习'时, 必须调用本工具(这是唯一能启动学习的工具), 否则设备不会进入学习状态、用户按遥控器无效。"
-            "调用方式: self.ir.learn_start(type='air_conditioner')。"
-            "设备侧不会播放任何语音提示, 引导用户逐键操作完全由你(模型)负责: 每学完一个键, 设备会向服务器发送'下一个'语音信号, "
-            "你听到'下一个'后, 必须根据本工具返回的按键顺序, 语音引导用户按下下一个键, 例如'好的, 请按[模式]键'。"
-            "禁止询问用户'下一个要按什么键', 禁止调用 self.ir.skip(除非用户明确说'跳过/不要这个键'), 不要问品牌、不要问学哪些键。"
-            "type: air_conditioner(默认, 空调, 固定顺序 电源/模式/温度+/温度-); tv(电视); custom(自定义, 需用 keys 传逗号分隔的按键列表)",
+            "当用户说'学习空调/学习遥控器/学习按键/开始学习'时, 必须调用本工具启动学习, 否则设备不进入学习状态、用户按遥控器无效。"
+            "调用: self.ir.learn_start(type='air_conditioner')。设备侧不播语音提示, 引导用户逐键操作完全由你(模型)负责: "
+            "每学完一个键, 设备会发送'下一个'语音信号, 你听到'下一个'后, 必须按本工具返回的按键顺序语音引导用户按下一个键, 如'好的, 请按[模式]键'; "
+            "禁止询问'下一个要按什么键', 禁止调用 self.ir.skip(除非用户明确说'跳过/不要这个键'), 不要问品牌/学哪些键。"
+            "type: air_conditioner(默认空调, 固定顺序 电源/模式/温度+/温度-); tv(电视); custom(自定义, keys 传逗号分隔按键列表)",
             PropertyList({
                 Property("type", kPropertyTypeString, std::string("air_conditioner")),
                 Property("keys", kPropertyTypeString, std::string(""))
