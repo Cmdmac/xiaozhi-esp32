@@ -10,6 +10,8 @@
 #include "alarm_manager.h"
 #include "codecs/mix_audio_codec.h"
 #include "assets/lang_config.h"
+#include "audio/demuxer/ogg_demuxer.h"
+#include "esp_opus_dec.h"
 
 #include "nvs_flash.h"
 
@@ -39,20 +41,36 @@ using heatpump_ir_tx::RemoteTransmitter;
 using heatpump_ir_tx::RemoteTransmitData;
 using heatpump_ir_tx::HeatPumpClimate;
 
-// ===== 学习静音派生类: 继承 AdcPdmAudioCodec, 覆写 Read() 实现学习期间麦克风静音 =====
+// ===== 学习静音派生类: 继承 AdcPdmAudioCodec, 覆写 Read() 实现学习期间麦克风静音 + 模拟回授 =====
 // 本地提示音(ogg)播放时扬声器声音会串入麦克风(无 AEC), 若设备处于聆听态, 回授音频会被
 // ASR 识别导致模型自问自答; 学习会话期间把读回的麦克风数据置 0, 可彻底切断该回授路径。
+// 同时支持"模拟回授": 把设备播放的提示音(如"下一个")直接注入上传通道, 让服务器 ASR
+// 识别出提示内容, 模型因此能"听到"设备播报并配合回复(如播报"请按XX键")。
 // 放在板卡代码内派生, 不修改基础 codec 实现。
 class LearningAdcPdmAudioCodec : public AdcPdmAudioCodec {
 private:
     volatile bool input_muted_ = false;
 
+    // 模拟回授数据: 待注入上传通道的 PCM(已重采样到麦克风采样率 16k), 由 StartFeedback 填充
+    std::vector<int16_t> feedback_pcm_;
+    size_t feedback_pos_ = 0;
+
 protected:
     virtual int Read(int16_t* dest, int samples) override {
+        // 1) 有模拟回授数据待注入 → 优先用它代替麦克风数据上传 (注入期间输入处于静音)
+        if (feedback_pos_ < feedback_pcm_.size()) {
+            size_t n = std::min<size_t>(samples, feedback_pcm_.size() - feedback_pos_);
+            memcpy(dest, feedback_pcm_.data() + feedback_pos_, n * sizeof(int16_t));
+            feedback_pos_ += n;
+            if (n < (size_t)samples) {
+                memset(dest + n, 0, ((size_t)samples - n) * sizeof(int16_t));
+            }
+            return samples;
+        }
         if (!input_muted_) {
             return AdcPdmAudioCodec::Read(dest, samples);
         }
-        // 静音期间仍先按真实节奏阻塞读取 (esp_codec_dev_read 等待 ADC 数据, 约 10ms/帧),
+        // 2) 静音: 先按真实节奏阻塞读取 (esp_codec_dev_read 等待 ADC 数据, 约 10ms/帧),
         // 再把读到的数据清零返回:
         // 1) 喇叭提示音的回授不会进入 ASR (防自问自答);
         // 2) 维持管线实时流速, 避免零数据以最高速灌入编码队列,
@@ -71,6 +89,44 @@ public:
     void SetInputMuted(bool muted) {
         input_muted_ = muted;
         ESP_LOGI(TAG, "SetInputMuted %d (学习期间麦克风%s采集)", muted, muted ? "静音, 防喇叭回授" : "恢复");
+    }
+
+    // 注入模拟回授: pcm 为本地提示音 ogg 解码出的 48kHz int16 数据, frames 为样本数。
+    // 内部线性重采样到麦克风采样率(input_sample_rate_, 本板 16k), 注入期间 Read 返回回授数据,
+    // 服务器 ASR 会把它识别成提示内容(如"下一个"), 使模型"听到"设备播报
+    void StartFeedback(const int16_t* pcm, size_t frames) {
+        feedback_pcm_.clear();
+        feedback_pos_ = 0;
+        if (pcm == nullptr || frames == 0) {
+            return;
+        }
+        const uint32_t in_sr = 48000;
+        const uint32_t out_sr = input_sample_rate_;
+        if (out_sr == 0) {
+            return;
+        }
+        if (in_sr == out_sr) {
+            feedback_pcm_.assign(pcm, pcm + frames);
+        } else {
+            // 线性插值重采样: out[i] = pcm[i*in/out] 附近按小数部分插值
+            size_t out_frames = frames * out_sr / in_sr + 1;
+            feedback_pcm_.reserve(out_frames);
+            for (size_t i = 0; i < out_frames; i++) {
+                uint64_t pos = (uint64_t)i * in_sr;
+                size_t idx = (size_t)(pos / out_sr);
+                if (idx + 1 >= frames) {
+                    feedback_pcm_.push_back(pcm[idx]);
+                    continue;
+                }
+                uint64_t frac = pos % out_sr;
+                uint32_t frac1024 = (uint32_t)(frac * 1024 / out_sr);
+                int32_t a = pcm[idx];
+                int32_t b = pcm[idx + 1];
+                feedback_pcm_.push_back((int16_t)((a * (1024 - (int32_t)frac1024) + b * (int32_t)frac1024) >> 10));
+            }
+        }
+        ESP_LOGI(TAG, "StartFeedback: %d frames(48k) -> %d frames(%dHz)", (int)frames,
+                 (int)feedback_pcm_.size(), (int)out_sr);
     }
 };
 
@@ -92,13 +148,31 @@ private:
     // 学习结束时延迟恢复麦克风: 完成提示音(PlaySound 异步)仍在喇叭播放,
     // 若立即恢复麦克风, 提示音会被回授进麦克风被 ASR 识别(自问自答)
     esp_timer_handle_t unmute_timer_ = nullptr;
-    static constexpr uint32_t UNMUTE_DELAY_MS = 1500;  // > success.ogg 时长(~0.6s) + 余量
+    static constexpr uint32_t UNMUTE_DELAY_MS = 2500;  // > "学习完成"提示音(~1.7s) + 余量
+
+    // 捕获按键后延时推进到下一个键: "下一个"提示音播放并模拟回授(上传给服务器)后,
+    // 留时间给 ASR 识别与模型播报, 再进入下一个键学习
+    esp_timer_handle_t next_timer_ = nullptr;
+    static constexpr uint32_t NEXT_DELAY_MS = 4000;
+
+    // 学习结束后延迟保存到 NVS 的倒计时 (ir_loop 每 20ms 递减):
+    // "学习完成"提示音(约1.7s)刚投递播放, NVS flash 写入会阻塞单核 CPU,
+    // 与播放重叠会听到卡顿, 故等提示音播完再保存
+    int save_delay_ticks_ = 0;
+    static constexpr int SAVE_DELAY_TICKS = 100;  // 100 * 20ms = 2s, 覆盖提示音时长+余量
 
     static void UnmuteTimerCallback(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
         auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(self->GetAudioCodec());
         if (codec) {
             codec->SetInputMuted(false);
+        }
+    }
+
+    static void NextTimerCallback(void* arg) {
+        auto* self = static_cast<WifiRemoteCompanion*>(arg);
+        if (self->ir_learner_) {
+            self->ir_learner_->nextKey();
         }
     }
 
@@ -110,16 +184,24 @@ private:
             if (self->ir_learner_) {
                 self->ir_learner_->loop();
             }
-            // 学习会话刚结束(isLearning true->false) → 自动保存学习结果到 NVS
+            // 学习会话刚结束(isLearning true->false) → 延迟保存学习结果到 NVS:
+            // 此刻"学习完成"提示音(约1.7s)刚被投递播放, NVS flash 写入会阻塞单核 CPU,
+            // 与播放重叠会听到卡顿, 故等提示音播完再写入
             bool learning = self->ir_learner_ ? self->ir_learner_->isLearning() : false;
             if (was_learning && !learning) {
-                self->SaveIRKeysToNVS();
+                self->save_delay_ticks_ = self->SAVE_DELAY_TICKS;
+            }
+            if (self->save_delay_ticks_ > 0) {
+                if (--self->save_delay_ticks_ == 0) {
+                    self->SaveIRKeysToNVS();
+                }
             }
             was_learning = learning;
 
-            // 无学习/回放任务时, 空闲约 1 秒(50*20ms)后自挂起, 由 EnsureIRLoopTask 唤醒,
-            // 避免一直空转; 挂起前留 1 秒余量以消除与 MCP 回调(启动学习)之间的竞态
-            if (self->ir_learner_ && !learning) {
+            // 无学习/回放且无待执行的延迟保存时, 空闲约 1 秒(50*20ms)后自挂起,
+            // 由 EnsureIRLoopTask 唤醒, 避免一直空转; 挂起前留 1 秒余量以消除与
+            // MCP 回调(启动学习)之间的竞态
+            if (self->ir_learner_ && !learning && self->save_delay_ticks_ == 0) {
                 if (++idle_ticks >= 50) {
                     idle_ticks = 0;
                     vTaskSuspend(nullptr);
@@ -335,9 +417,68 @@ private:
         ir_learner_ = new IRLearner(IR_RX_GPIO, IR_TX_GPIO);
         ir_learner_->setup();
         ir_learner_->setIRSender(new IRSenderRMT(&ir_tx_));
-        // 捕获到按键时播放提示音, 让用户知道信号收到、可以松开遥控器
-        ir_learner_->setOnKeyCaptured([]() {
-            Application::GetInstance().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        // 捕获到按键(非最后键): 把"下一个"提示音直接发送到小智服务端音频通道,
+        // 服务器 ASR 识别出"下一个", 模型因此"听到"并语音回复引导(如"好的, 请按模式键");
+        // 本地播放 popup 短音效作为按键反馈(确认用户按键已被捕获), 不播放"下一个"人声,
+        // 引导用户按哪个键仍由模型语音负责, 不播放 ic_ac 那类"请按XX键"提示音
+        ir_learner_->setOnKeyCaptured([this]() {
+            const auto& ogg = Lang::Sounds::OGG_IR_NEXT;
+            // 直发方案(当前): 把"下一个"ogg 拆成 opus 帧经小智主协议上行, 供服务器 ASR 识别
+            Application::GetInstance().SendOggToServer(std::vector<uint8_t>(ogg.begin(), ogg.end()));
+            // 本地播放 popup 短音效作为按键反馈提示音
+            Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+
+            // 以下为模拟回授方案(已弃用, 保留备查): 解码 ogg 得到 48kHz PCM, 注入 codec 模拟麦克风。
+            // 注意: OggDemuxer 回调传入的是 opus 压缩包(每个音频包触发一次回调), 不是 PCM!
+            // 需先用 opus 解码器解出 PCM 并累积成完整音频, 再一次性注入上传通道,
+            // 否则 ASR 收到的全是压缩数据碎片, 无法识别"下一个"
+            // std::vector<int16_t> pcm;
+            // void* opus_dec = nullptr;
+            // esp_opus_dec_cfg_t dec_cfg = {
+            //     .sample_rate = 48000,
+            //     .channel = ESP_AUDIO_MONO,
+            //     .frame_duration = ESP_OPUS_DEC_FRAME_DURATION_INVALID,
+            //     .self_delimited = false,
+            // };
+            // if (esp_opus_dec_open(&dec_cfg, sizeof(dec_cfg), &opus_dec) == ESP_AUDIO_ERR_OK && opus_dec != nullptr) {
+            //     auto demuxer = std::make_unique<OggDemuxer>();
+            //     demuxer->OnDemuxerFinished([&pcm, opus_dec](const uint8_t* data, int sample_rate, size_t size) {
+            //         std::vector<int16_t> frame(4800);  // 100ms @48k 缓冲, 足够容纳单帧解码输出
+            //         esp_audio_dec_in_raw_t raw = {
+            //             .buffer = const_cast<uint8_t*>(data),
+            //             .len = (uint32_t)size,
+            //             .consumed = 0,
+            //             .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+            //         };
+            //         esp_audio_dec_out_frame_t out = {
+            //             .buffer = (uint8_t*)frame.data(),
+            //             .len = (uint32_t)(frame.size() * sizeof(int16_t)),
+            //             .decoded_size = 0,
+            //         };
+            //         esp_audio_dec_info_t info = {};
+            //         if (esp_opus_dec_decode(opus_dec, &raw, &out, &info) == ESP_AUDIO_ERR_OK) {
+            //             size_t n = out.decoded_size / sizeof(int16_t);
+            //             pcm.insert(pcm.end(), frame.begin(), frame.begin() + n);
+            //         }
+            //     });
+            //     demuxer->Reset();
+            //     demuxer->Process(reinterpret_cast<const uint8_t*>(ogg.data()), ogg.size());
+            //     esp_opus_dec_close(opus_dec);
+            // }
+            // auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(GetAudioCodec());
+            // if (codec) {
+            //     codec->StartFeedback(pcm.data(), pcm.size());
+            // }
+            // 本地也播放"下一个", 用户听到提示, 与上传同步
+            // Application::GetInstance().PlaySound(ogg);
+
+            // 解除模型 TTS 抑制: 让模型对"下一个"的回复(如"好的, 请按模式键")可以播报出来
+            Application::GetInstance().SetSuppressNetworkAudio(false);
+            // 留时间给上传+ASR识别+模型播报, 延时后推进到下一个键
+            if (next_timer_) {
+                esp_timer_stop(next_timer_);
+                esp_timer_start_once(next_timer_, NEXT_DELAY_MS * 1000);
+            }
         });
         // 学习全部完成时播放"学习完成"语音提示 (本地人声, 不依赖模型/网络)
         ir_learner_->setOnLearningCompleted([]() {
@@ -356,7 +497,8 @@ private:
             else if (key == "左右扫风") snd = &Lang::Sounds::OGG_IR_AC_SWING_H;
             else if (key == "定时") snd = &Lang::Sounds::OGG_IR_AC_TIME;
             if (snd != nullptr) {
-                Application::GetInstance().PlaySound(*snd);
+                // 由模型语音引导用户按哪个键, 本地不再播放"请按XX键"提示音
+                // Application::GetInstance().PlaySound(*snd);
             }
         });
         // 学习会话开始/结束时静音/恢复麦克风:
@@ -371,19 +513,29 @@ private:
             .name = "unmute_timer",
         };
         ESP_ERROR_CHECK(esp_timer_create(&unmute_timer_args, &unmute_timer_));
+        esp_timer_create_args_t next_timer_args = {
+            .callback = &WifiRemoteCompanion::NextTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ir_next_timer",
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&next_timer_args, &next_timer_));
         ir_learner_->setOnLearningStateChanged([this](bool learning) {
             auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(GetAudioCodec());
             if (!codec) {
                 return;
             }
-            // 学习期间同时抑制服务器下发的模型 TTS: 模型在 learn_start 后仍会自编回复
-            // (如"好的"/"请按遥控器按键"), 这些 TTS 会与本地按键提示音重叠; 直接丢弃,
-            // 本地 PlaySound 提示音不受影响
-            Application::GetInstance().SetSuppressNetworkAudio(learning);
+            // 学习期间不再抑制模型 TTS: 用户引导完全由模型语音承担
+            // (learn_start 回复"请按XX键"、对"下一个"的回复都需要播报), 本地不再播放提示音,
+            // 不存在与本地提示音重叠的问题, 故保持默认(不抑制)
+            // Application::GetInstance().SetSuppressNetworkAudio(learning);
             if (learning) {
-                // 新学习会话开始: 立即静音, 并取消可能挂起的恢复定时器
+                // 新学习会话开始: 立即静音, 并取消可能挂起的恢复/推进定时器
                 if (unmute_timer_) {
                     esp_timer_stop(unmute_timer_);
+                }
+                if (next_timer_) {
+                    esp_timer_stop(next_timer_);
                 }
                 codec->SetInputMuted(true);
             } else {
@@ -635,10 +787,11 @@ private:
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
             "当用户说'学习空调/学习遥控器/学习按键/开始学习'时, 必须调用本工具(这是唯一能启动学习的工具), 否则设备不会进入学习状态、用户按遥控器无效。"
-            "调用方式: self.ir.learn_start(type='air_conditioner')。调用后简短回应'好的'即可, 不要问品牌、不要问学哪些键——"
-            "设备会自动播放'请按XX键'的语音提示引导用户逐键操作。"
-            "type: air_conditioner(默认, 空调, 固定顺序 电源/模式/温度+/温度-); tv(电视); custom(自定义, 需用 keys 传逗号分隔的按键列表)。"
-            "注意: 不要在调用前说'请先按XX键'之类的话, 直接调用本工具",
+            "调用方式: self.ir.learn_start(type='air_conditioner')。"
+            "设备侧不会播放任何语音提示, 引导用户逐键操作完全由你(模型)负责: 每学完一个键, 设备会向服务器发送'下一个'语音信号, "
+            "你听到'下一个'后, 必须根据本工具返回的按键顺序, 语音引导用户按下下一个键, 例如'好的, 请按[模式]键'。"
+            "禁止询问用户'下一个要按什么键', 禁止调用 self.ir.skip(除非用户明确说'跳过/不要这个键'), 不要问品牌、不要问学哪些键。"
+            "type: air_conditioner(默认, 空调, 固定顺序 电源/模式/温度+/温度-); tv(电视); custom(自定义, 需用 keys 传逗号分隔的按键列表)",
             PropertyList({
                 Property("type", kPropertyTypeString, std::string("air_conditioner")),
                 Property("keys", kPropertyTypeString, std::string(""))
@@ -651,7 +804,7 @@ private:
                 EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                 if (type == "tv") {
                     ir_learner_->learnTV();  // 固定顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单
-                    return "{\"success\": true, \"message\": \"好的\"}";
+                    return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单。请用户先按[电源]键\"}";
                 }
                 if (type == "custom") {
                     // 解析 keys (兼容中英文逗号与空格)
@@ -661,25 +814,33 @@ private:
                         if (ch == '，' || ch == ',') ch = ',';
                     }
                     size_t pos = 0;
+                    std::string keylist = "";
                     while ((pos = keys.find(',')) != std::string::npos) {
                         std::string key = keys.substr(0, pos);
                         key.erase(0, key.find_first_not_of(" \t\r\n"));
                         key.erase(key.find_last_not_of(" \t\r\n") + 1);
-                        if (!key.empty()) ir_learner_->addTargetKey(key);
+                        if (!key.empty()) {
+                            ir_learner_->addTargetKey(key);
+                            keylist += (keylist.empty() ? "" : "/") + key;
+                        }
                         keys.erase(0, pos + 1);
                     }
                     keys.erase(0, keys.find_first_not_of(" \t\r\n"));
                     keys.erase(keys.find_last_not_of(" \t\r\n") + 1);
-                    if (!keys.empty()) ir_learner_->addTargetKey(keys);
+                    if (!keys.empty()) {
+                        ir_learner_->addTargetKey(keys);
+                        keylist += (keylist.empty() ? "" : "/") + keys;
+                    }
                     if (ir_learner_->getKeys().empty()) {
                         return "{\"success\": false, \"message\": \"custom 模式需要提供 keys 按键列表\"}";
                     }
                     ir_learner_->startLearning();
-                    return "{\"success\": true, \"message\": \"好的\"}";
+                    std::string first_key = ir_learner_->getKeys().front().name;
+                    return "{\"success\": true, \"message\": \"好的, 学习顺序: " + keylist + "。请用户先按[" + first_key + "]键\"}";
                 }
                 // 默认: 空调
                 ir_learner_->learnAirConditioner();  // 固定顺序: 电源/模式/温度+/温度-
-                return "{\"success\": true, \"message\": \"好的\"}";
+                return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源/模式/温度+/温度-。请用户先按[电源]键\"}";
             });
 
         mcp_server.AddTool("self.ir.learn_status",
@@ -725,7 +886,8 @@ private:
             });
 
         mcp_server.AddTool("self.ir.skip",
-            "跳过当前正在学习的按键",
+            "仅当用户明确说出'跳过/下一个键不要了/不用学这个键'时才调用, 跳过当前正在学习的按键。"
+            "注意: 学习过程中设备自动发送的'下一个'信号是正常推进信号, 不是跳过指令, 听到'下一个'时严禁调用本工具",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 ir_learner_->skipCurrentKey();

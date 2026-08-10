@@ -267,6 +267,20 @@ public:
         startLearning();
     }
 
+    // 学习完当前键后推进到下一个键 (由板卡在播放完"下一个"提示音+模拟回授后调用)
+    void nextKey() {
+        if (!isSessionActive_ || !waitingAfterCapture_) {
+            return;
+        }
+        waitingAfterCapture_ = false;
+        currentKeyIndex_++;
+        if (currentKeyIndex_ < (int)keys_.size()) {
+            promptUser();  // 播"请按XX键", 等待用户按遥控器
+        } else {
+            stopLearning();
+        }
+    }
+
     // 跳过当前按键
     void skipCurrentKey() {
         if (!isSessionActive_) return;
@@ -289,19 +303,9 @@ public:
 
         if (!isSessionActive_ || !receiver_) return;
 
-        // 捕获后的冷却期: 丢弃连发码(用户按住遥控器会连发多帧), 冷却结束后
-        // 自动推进到下一个键并继续接收, 保证用户按下一个键时一定能被捕获。
-        // 每个键的语音提示由设备端自动播放(见 setOnPromptKey), 用户无需说任何话
+        // 捕获后的等待期: 不再自动推进——由板卡播放"下一个"提示音并模拟回授(上传给服务器),
+        // 模型听到后播报"请按XX键", 板卡随后调用 nextKey() 推进到下一个键
         if (waitingAfterCapture_) {
-            if ((xTaskGetTickCount() * portTICK_PERIOD_MS) - waitStartMs_ >= 1500) {
-                waitingAfterCapture_ = false;
-                currentKeyIndex_++;
-                if (currentKeyIndex_ < (int)keys_.size()) {
-                    promptUser();  // 自动推进到下一个键, 等待用户按键
-                } else {
-                    stopLearning();
-                }
-            }
             return;
         }
         if (receiver_->decode(&results_)) {
@@ -354,11 +358,14 @@ public:
             }
 
             receiver_->resume();
-            // 播放捕获提示音 (告知用户收到信号, 可以松开遥控器)
-            if (on_key_captured_) on_key_captured_();
-            // 进入等待确认状态: 等用户说"下一个"后由 learn_status 推进
-            waitingAfterCapture_ = true;
-            waitStartMs_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (currentKeyIndex_ == (int)keys_.size() - 1) {
+                // 最后一个键已学完 → 直接完成学习 (播放"学习完成"提示音)
+                stopLearning();
+            } else {
+                // 非最后键: 通知板卡播放"下一个"提示音并模拟回授, 稍后由 nextKey() 推进
+                if (on_key_captured_) on_key_captured_();
+                waitingAfterCapture_ = true;
+            }
         }
     }
 

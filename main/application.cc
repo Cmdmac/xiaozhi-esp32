@@ -18,6 +18,8 @@
 #include <arpa/inet.h>
 #include <font_awesome.h>
 #include "codecs/mix_audio_codec.h"
+#include "codecs/websocket_codec.h"
+#include "audio/demuxer/ogg_demuxer.h"
 
 #define TAG "Application"
 
@@ -1206,6 +1208,34 @@ void Application::SendMcpMessage(const std::string& payload) {
     Schedule([this, payload = std::move(payload)]() {
         if (protocol_) {
             protocol_->SendMcpMessage(payload);
+        }
+    });
+}
+
+void Application::SendOggToServer(const std::vector<uint8_t>& ogg) {
+    // protocol_ 只能由主任务访问, 拆帧/入队/发送全部在 Schedule 回调中完成
+    Schedule([this, ogg]() {
+        if (protocol_ == nullptr || !protocol_->IsAudioChannelOpened()) {
+            ESP_LOGW(TAG, "Audio channel not opened, skip sending ogg to server");
+            return;
+        }
+        // 用 OggDemuxer 拆出每个独立 opus 压缩包(与 PlaySound 相同的解析路径)。
+        // 注意不能用 OggParser 攒帧拼包的方式: 它把 3 个 opus 压缩帧拼成一个 buffer 发送,
+        // 服务器解码器无法识别拼接帧, ASR 会识别失败
+        std::vector<std::vector<uint8_t>> frames;
+        auto demuxer = std::make_unique<OggDemuxer>();
+        demuxer->OnDemuxerFinished([&frames](const uint8_t* data, int sample_rate, size_t size) {
+            frames.emplace_back(data, data + size);
+        });
+        demuxer->Reset();
+        demuxer->Process(ogg.data(), ogg.size());
+        ESP_LOGI(TAG, "Send %d opus frames to server", (int)frames.size());
+        // 逐个入队后立即消费发送, 不依赖状态机在状态切换时才消费 openclaw 队列
+        for (auto& frame : frames) {
+            audio_service_.PushTaskToOpenClawSendQueue(frame);
+        }
+        while (auto packet = audio_service_.PopFromOpenClawSendQueue()) {
+            protocol_->SendAudio(std::move(packet));
         }
     });
 }
