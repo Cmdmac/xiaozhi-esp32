@@ -29,6 +29,7 @@
                 "CONFIG_COMPILER_OPTIMIZATION_SIZE=y",
                 "CONFIG_CODEC_DATA_ADC_SUPPORT=y",
                 "CONFIG_GPTIMER_ISR_IRAM_SAFE=y",
+                "CONFIG_ESP_TIMER_ISR_IRAM_SAFE=y",
                 "CONFIG_RMT_ISR_IRAM_SAFE=y"
             ]
         }

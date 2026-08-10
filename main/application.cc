@@ -514,7 +514,7 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        if (GetDeviceState() == kDeviceStateSpeaking && !suppress_network_audio_) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -1239,6 +1239,10 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
+}
+
+void Application::SetSuppressNetworkAudio(bool suppress) {
+    suppress_network_audio_ = suppress;
 }
 
 void Application::ResetProtocol() {

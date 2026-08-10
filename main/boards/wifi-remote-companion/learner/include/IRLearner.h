@@ -87,6 +87,15 @@ private:
     // 捕获到一个有效按键后的回调 (外部用于播放提示音)
     std::function<void()> on_key_captured_;
 
+    // 提示用户按某个键时的回调 (外部用于播放对应的按键语音提示, 如"请按电源键")
+    std::function<void(const std::string&)> on_prompt_key_;
+
+    // 学习会话开始/结束回调 (外部用于静音/恢复麦克风, 防止喇叭提示音回授串入麦克风)
+    std::function<void(bool)> on_learning_state_changed_;
+
+    // 学习全部完成回调 (外部用于播放"学习完成"语音提示)
+    std::function<void()> on_learning_completed_;
+
     // 非阻塞延时状态机: 捕获后等待一段时间再切到下一个键
     bool waitingAfterCapture_ = false;  // 正在等待(让用户松开遥控器)
     uint32_t waitStartMs_ = 0;          // 等待起始时刻
@@ -108,6 +117,11 @@ private:
             ESP_LOGI(TAG, ">>> 请按下遥控器的 [%s] 键 <<<",
                      keys_[currentKeyIndex_].name.c_str());
             ESP_LOGI(TAG, "--------------------------------");
+            // 播放对应按键的语音提示 (如"请按电源键"), 让用户知道该按哪个键。
+            // 模型不会主动提示(它不知道设备推进到哪个键), 必须由设备本地播报
+            if (on_prompt_key_) {
+                on_prompt_key_(keys_[currentKeyIndex_].name);
+            }
         } else {
             stopLearning();
         }
@@ -127,6 +141,16 @@ private:
         ESP_LOGI(TAG, "===========================");
         ESP_LOGI(TAG, "  所有按键学习完成!");
         ESP_LOGI(TAG, "===========================");
+        // 播放完成提示音, 让用户知道学习结束
+        if (on_learning_completed_) {
+            on_learning_completed_();
+        } else if (on_key_captured_) {
+            on_key_captured_();
+        }
+        // 通知外部: 学习会话结束 (恢复麦克风采集)
+        if (on_learning_state_changed_) {
+            on_learning_state_changed_(false);
+        }
     }
 
 public:
@@ -148,6 +172,21 @@ public:
     // 设置捕获到有效按键时的回调 (外部播放提示音, 让用户知道收到信号了)
     void setOnKeyCaptured(std::function<void()> cb) {
         on_key_captured_ = std::move(cb);
+    }
+
+    // 设置提示用户按某键时的回调 (外部播放对应按键的语音提示)
+    void setOnPromptKey(std::function<void(const std::string&)> cb) {
+        on_prompt_key_ = std::move(cb);
+    }
+
+    // 设置学习会话开始/结束回调 (外部静音/恢复麦克风, 防止喇叭提示音回授)
+    void setOnLearningStateChanged(std::function<void(bool)> cb) {
+        on_learning_state_changed_ = std::move(cb);
+    }
+
+    // 设置学习全部完成回调 (外部播放"学习完成"语音提示)
+    void setOnLearningCompleted(std::function<void()> cb) {
+        on_learning_completed_ = std::move(cb);
     }
 
     // 初始化
@@ -193,6 +232,10 @@ public:
         waitingAfterCapture_ = false;  // 清除等待状态
         lastStatusMsg_ = "开始学习模式...";
         ESP_LOGI(TAG, "开始学习模式...");
+        // 通知外部: 学习会话开始 (静音麦克风, 防止喇叭提示音回授串入麦克风被 ASR 误识别)
+        if (on_learning_state_changed_) {
+            on_learning_state_changed_(true);
+        }
         promptUser();
     }
 
@@ -239,26 +282,6 @@ public:
         }
     }
 
-    // 用户说"下一个"后由 learn_status 工具调用: 确认当前键已学习并推进到下一键
-    // 返回 true 表示还有键要学(或当前键还没捕获, 保持原提示); false 表示学习已结束
-    bool advanceToNextKey() {
-        if (!isSessionActive_) return false;
-        if (waitingAfterCapture_) {
-            // 还在冷却期(用户已确认当前键学完) → 立即推进, 让模型能马上播报下一键提示
-            waitingAfterCapture_ = false;
-            if (receiver_) receiver_->resume();
-            currentKeyIndex_++;
-            if (currentKeyIndex_ < (int)keys_.size()) {
-                promptUser();
-                return true;
-            }
-            stopLearning();
-            return false;
-        }
-        // 已自动推进或当前键还没捕获 → 返回当前提示
-        return true;
-    }
-
     // 主循环 (在 Arduino loop 中调用)
     void loop() {
         // 先处理待发送的红外指令 (从主循环执行, 避免 Web 任务时序干扰)
@@ -268,7 +291,7 @@ public:
 
         // 捕获后的冷却期: 丢弃连发码(用户按住遥控器会连发多帧), 冷却结束后
         // 自动推进到下一个键并继续接收, 保证用户按下一个键时一定能被捕获。
-        // 语音提示由模型负责: 用户说"下一个"后 learn_status 返回当前键提示并播报
+        // 每个键的语音提示由设备端自动播放(见 setOnPromptKey), 用户无需说任何话
         if (waitingAfterCapture_) {
             if ((xTaskGetTickCount() * portTICK_PERIOD_MS) - waitStartMs_ >= 1500) {
                 waitingAfterCapture_ = false;
@@ -404,10 +427,15 @@ public:
 
     // 重置
     void reset() {
+        bool was_active = isSessionActive_;
         keys_.clear();
         isSessionActive_ = false;
         currentKeyIndex_ = -1;
         waitingAfterCapture_ = false;
+        // 若学习会话正在执行中被重置, 需通知外部恢复麦克风采集
+        if (was_active && on_learning_state_changed_) {
+            on_learning_state_changed_(false);
+        }
         ESP_LOGI("IRLearner2", "已重置任务列表");
     }
 

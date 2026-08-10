@@ -20,8 +20,12 @@ private:
     // 定时器回调函数
     static void OutputTimerCallback(void* arg);
 
-    virtual int Read(int16_t* dest, int samples) override;
     virtual int Write(const int16_t* data, int samples) override;
+
+protected:
+    // Read() 供板卡代码中的派生类覆写, 用于学习等场景临时静音麦克风
+    // (喇叭播放本地提示音时声音会串入麦克风, 无 AEC, 需在学习期间把读回数据置 0 防回授)
+    virtual int Read(int16_t* dest, int samples) override;
 
 public:
     AdcPdmAudioCodec(int input_sample_rate, int output_sample_rate,

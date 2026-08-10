@@ -39,6 +39,41 @@ using heatpump_ir_tx::RemoteTransmitter;
 using heatpump_ir_tx::RemoteTransmitData;
 using heatpump_ir_tx::HeatPumpClimate;
 
+// ===== 学习静音派生类: 继承 AdcPdmAudioCodec, 覆写 Read() 实现学习期间麦克风静音 =====
+// 本地提示音(ogg)播放时扬声器声音会串入麦克风(无 AEC), 若设备处于聆听态, 回授音频会被
+// ASR 识别导致模型自问自答; 学习会话期间把读回的麦克风数据置 0, 可彻底切断该回授路径。
+// 放在板卡代码内派生, 不修改基础 codec 实现。
+class LearningAdcPdmAudioCodec : public AdcPdmAudioCodec {
+private:
+    volatile bool input_muted_ = false;
+
+protected:
+    virtual int Read(int16_t* dest, int samples) override {
+        if (!input_muted_) {
+            return AdcPdmAudioCodec::Read(dest, samples);
+        }
+        // 静音期间仍先按真实节奏阻塞读取 (esp_codec_dev_read 等待 ADC 数据, 约 10ms/帧),
+        // 再把读到的数据清零返回:
+        // 1) 喇叭提示音的回授不会进入 ASR (防自问自答);
+        // 2) 维持管线实时流速, 避免零数据以最高速灌入编码队列,
+        //    导致 opus_codec 忙转饿死 IDLE 任务触发任务看门狗
+        int ret = AdcPdmAudioCodec::Read(dest, samples);
+        memset(dest, 0, samples * sizeof(int16_t));
+        return ret;
+    }
+
+public:
+    LearningAdcPdmAudioCodec(int input_sample_rate, int output_sample_rate,
+        uint32_t adc_mic_channel, gpio_num_t pdm_speak_p, gpio_num_t pdm_speak_n, gpio_num_t pa_ctl)
+        : AdcPdmAudioCodec(input_sample_rate, output_sample_rate, adc_mic_channel,
+                           pdm_speak_p, pdm_speak_n, pa_ctl) {}
+
+    void SetInputMuted(bool muted) {
+        input_muted_ = muted;
+        ESP_LOGI(TAG, "SetInputMuted %d (学习期间麦克风%s采集)", muted, muted ? "静音, 防喇叭回授" : "恢复");
+    }
+};
+
 class WifiRemoteCompanion : public WifiBoard {
 private:
     Button boot_button_;
@@ -53,6 +88,19 @@ private:
     bool ac_protocol_configured_ = false;            // 是否已显式设置过品牌(NVS/set_protocol)
     IRLearner* ir_learner_ = nullptr;
     TaskHandle_t ir_task_ = nullptr;
+
+    // 学习结束时延迟恢复麦克风: 完成提示音(PlaySound 异步)仍在喇叭播放,
+    // 若立即恢复麦克风, 提示音会被回授进麦克风被 ASR 识别(自问自答)
+    esp_timer_handle_t unmute_timer_ = nullptr;
+    static constexpr uint32_t UNMUTE_DELAY_MS = 1500;  // > success.ogg 时长(~0.6s) + 余量
+
+    static void UnmuteTimerCallback(void* arg) {
+        auto* self = static_cast<WifiRemoteCompanion*>(arg);
+        auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(self->GetAudioCodec());
+        if (codec) {
+            codec->SetInputMuted(false);
+        }
+    }
 
     static void IRLoopTask(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
@@ -287,9 +335,63 @@ private:
         ir_learner_ = new IRLearner(IR_RX_GPIO, IR_TX_GPIO);
         ir_learner_->setup();
         ir_learner_->setIRSender(new IRSenderRMT(&ir_tx_));
-        // 捕获到按键时播放提示音, 让用户知道信号收到、可以松开遥控器并说"下一个"
+        // 捕获到按键时播放提示音, 让用户知道信号收到、可以松开遥控器
         ir_learner_->setOnKeyCaptured([]() {
             Application::GetInstance().PlaySound(Lang::Sounds::OGG_SUCCESS);
+        });
+        // 学习全部完成时播放"学习完成"语音提示 (本地人声, 不依赖模型/网络)
+        ir_learner_->setOnLearningCompleted([]() {
+            Application::GetInstance().PlaySound(Lang::Sounds::OGG_IR_LEARN_DONE);
+        });
+        // 提示用户按某个键时播放对应按键的语音提示(学习空调时依次播报"请按电源键/模式键/温度+/温度-")。
+        // 提示音为 48kHz, 与 TTS 采样率一致, 不会触发解码器反复重建
+        ir_learner_->setOnPromptKey([](const std::string& key) {
+            const std::string_view* snd = nullptr;
+            if (key == "电源") snd = &Lang::Sounds::OGG_IR_AC_POWER;
+            else if (key == "模式") snd = &Lang::Sounds::OGG_IR_AC_MODE;
+            else if (key == "温度+") snd = &Lang::Sounds::OGG_IR_AC_ADD_TEMP;
+            else if (key == "温度-") snd = &Lang::Sounds::OGG_IR_AC_SUB_TEMP;
+            else if (key == "风速") snd = &Lang::Sounds::OGG_IR_AC_WIND;
+            else if (key == "上下扫风") snd = &Lang::Sounds::OGG_IR_AC_SWING_V;
+            else if (key == "左右扫风") snd = &Lang::Sounds::OGG_IR_AC_SWING_H;
+            else if (key == "定时") snd = &Lang::Sounds::OGG_IR_AC_TIME;
+            if (snd != nullptr) {
+                Application::GetInstance().PlaySound(*snd);
+            }
+        });
+        // 学习会话开始/结束时静音/恢复麦克风:
+        // 提示音(本地 ogg)播放时扬声器声音会串入麦克风(无 AEC), 若此时设备处于聆听态,
+        // 回授音频会被 ASR 识别, 导致模型误以为用户在说话而自行回应; 学习期间静音麦克风可彻底切断。
+        // 注意: 学习结束时不能立即恢复——完成提示音(PlaySound 异步)还在喇叭上播放, 恢复过早
+        // 会把提示音回授进麦克风被 ASR 识别(日志里 "不们。" 这类乱码); 用定时器延迟到提示音播完
+        esp_timer_create_args_t unmute_timer_args = {
+            .callback = &WifiRemoteCompanion::UnmuteTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "unmute_timer",
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&unmute_timer_args, &unmute_timer_));
+        ir_learner_->setOnLearningStateChanged([this](bool learning) {
+            auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(GetAudioCodec());
+            if (!codec) {
+                return;
+            }
+            // 学习期间同时抑制服务器下发的模型 TTS: 模型在 learn_start 后仍会自编回复
+            // (如"好的"/"请按遥控器按键"), 这些 TTS 会与本地按键提示音重叠; 直接丢弃,
+            // 本地 PlaySound 提示音不受影响
+            Application::GetInstance().SetSuppressNetworkAudio(learning);
+            if (learning) {
+                // 新学习会话开始: 立即静音, 并取消可能挂起的恢复定时器
+                if (unmute_timer_) {
+                    esp_timer_stop(unmute_timer_);
+                }
+                codec->SetInputMuted(true);
+            } else {
+                // 学习结束: 延迟恢复麦克风, 等完成提示音播放完毕再解除静音
+                if (unmute_timer_) {
+                    esp_timer_start_once(unmute_timer_, UNMUTE_DELAY_MS * 1000);
+                }
+            }
         });
 
         // 开机从 NVS 恢复上次学习结果 (学习完成后由 ir_loop 任务自动保存)
@@ -532,9 +634,11 @@ private:
 
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
-            "开始红外学习。重要: 用户说'学习空调/电视/遥控器按键'时, 必须直接调用本工具开始学习, 不要询问品牌、不要询问要学哪些键, 也不要跳过工具自行播报。"
-            "type 默认 air_conditioner(空调, 固定顺序: 电源/模式/温度+/温度-, 用户无需选择按键); tv(电视, 顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单); custom(自定义, 用 keys 指定逗号分隔的按键名列表)。"
-            "调用后工具返回的 message 就是你要播报的内容。学习流程: 每按完一个键设备会播放提示音表示收到, 然后用户说'下一个', 此时调用 self.ir.learn_status 获取下一键提示并播报(如'电源已学习, 请按[模式]键'); 全部学完后 learn_status 返回 learning=false, 播报'按键学习完成'",
+            "当用户说'学习空调/学习遥控器/学习按键/开始学习'时, 必须调用本工具(这是唯一能启动学习的工具), 否则设备不会进入学习状态、用户按遥控器无效。"
+            "调用方式: self.ir.learn_start(type='air_conditioner')。调用后简短回应'好的'即可, 不要问品牌、不要问学哪些键——"
+            "设备会自动播放'请按XX键'的语音提示引导用户逐键操作。"
+            "type: air_conditioner(默认, 空调, 固定顺序 电源/模式/温度+/温度-); tv(电视); custom(自定义, 需用 keys 传逗号分隔的按键列表)。"
+            "注意: 不要在调用前说'请先按XX键'之类的话, 直接调用本工具",
             PropertyList({
                 Property("type", kPropertyTypeString, std::string("air_conditioner")),
                 Property("keys", kPropertyTypeString, std::string(""))
@@ -547,7 +651,7 @@ private:
                 EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                 if (type == "tv") {
                     ir_learner_->learnTV();  // 固定顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单
-                    return "{\"success\": true, \"message\": \"开始学习电视按键, 请先按[电源]键, 每按完一个键告诉我'下一个'\"}";
+                    return "{\"success\": true, \"message\": \"好的\"}";
                 }
                 if (type == "custom") {
                     // 解析 keys (兼容中英文逗号与空格)
@@ -571,23 +675,21 @@ private:
                         return "{\"success\": false, \"message\": \"custom 模式需要提供 keys 按键列表\"}";
                     }
                     ir_learner_->startLearning();
-                    return "{\"success\": true, \"message\": \"开始学习自定义按键, 请先按[第一个键], 每按完一个键告诉我'下一个'\"}";
+                    return "{\"success\": true, \"message\": \"好的\"}";
                 }
                 // 默认: 空调
                 ir_learner_->learnAirConditioner();  // 固定顺序: 电源/模式/温度+/温度-
-                return "{\"success\": true, \"message\": \"开始学习空调按键, 请先按[电源]键, 每按完一个键告诉我'下一个'\"}";
+                return "{\"success\": true, \"message\": \"好的\"}";
             });
 
         mcp_server.AddTool("self.ir.learn_status",
-            "查询红外学习状态与当前提示。用户每按完一个键并说'下一个'后, 必须调用本工具: 它会确认当前键已学习并推进到下一键。根据返回结果向用户播报: "
-            "若 learning=true, 播报 message 中的提示(如'电源已学习, 请按[模式]键'); 若 learning=false, 播报'按键学习完成'",
+            "查询红外学习状态(可选, 仅当用户询问'学到哪了/学完了吗'时使用)。学习期间设备会自动推进并语音提示, 本工具不负责推进。"
+            "返回 learning(是否仍在学习), keys(按键列表), message(当前进度提示)。若 learning=false 表示学习已完成",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 if (ir_learner_ == nullptr) {
                     return "{\"success\": false, \"message\": \"IR learner not initialized\"}";
                 }
-                // 用户说"下一个" → 确认当前键并推进到下一键
-                ir_learner_->advanceToNextKey();
                 std::string msg = ir_learner_->getStatusMessage().c_str();
                 auto& keys = ir_learner_->getKeys();
                 std::string keylist = "[";
@@ -735,7 +837,7 @@ public:
     virtual AudioCodec* GetAudioCodec() override
     {
         // if (mix_audio_codec_ == nullptr) {
-            static AdcPdmAudioCodec audio_codec(
+            static LearningAdcPdmAudioCodec audio_codec(
                 AUDIO_INPUT_SAMPLE_RATE,
                 AUDIO_OUTPUT_SAMPLE_RATE,
                 AUDIO_ADC_MIC_CHANNEL,
