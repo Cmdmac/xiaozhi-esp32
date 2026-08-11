@@ -145,10 +145,11 @@ private:
     IRLearner* ir_learner_ = nullptr;
     TaskHandle_t ir_task_ = nullptr;
 
-    // 学习结束时延迟恢复麦克风: 完成提示音(PlaySound 异步)仍在喇叭播放,
-    // 若立即恢复麦克风, 提示音会被回授进麦克风被 ASR 识别(自问自答)
+    // 学习结束时延迟恢复麦克风: 模型对"学习完成"的总结 TTS 仍在喇叭播放时不能恢复,
+    // 否则 TTS 会被回授进麦克风被 ASR 识别(自问自答)。先等 UNMUTE_DELAY_MS, 若设备
+    // 仍处于 speaking(模型 TTS 还没播完)则继续等待, 直到 TTS 播完才真正恢复麦克风。
     esp_timer_handle_t unmute_timer_ = nullptr;
-    static constexpr uint32_t UNMUTE_DELAY_MS = 2500;  // > "学习完成"提示音(~1.7s) + 余量
+    static constexpr uint32_t UNMUTE_DELAY_MS = 2500;  // 首轮等待时间, 之后按 speaking 状态续等
 
     // 捕获按键后由模型语音驱动推进到下一个键: 不再用固定倒计时盲推,
     // 而是检测模型对"下一个"的语音回复(TTS)播完(speaking -> 非 speaking)后再 nextKey()。
@@ -181,6 +182,13 @@ private:
 
     static void UnmuteTimerCallback(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
+        // 模型对"学习完成"的总结 TTS 可能长于 UNMUTE_DELAY_MS: 若此刻仍在播放, 恢复麦克风
+        // 会把喇叭声音回授进麦克风被 ASR 识别(自问自答/乱码), 故继续等待 TTS 播完(speaking
+        // 结束)再恢复麦克风, 保证学习结束后用户随时说话都能被听到
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+            esp_timer_start_once(self->unmute_timer_, self->UNMUTE_DELAY_MS * 1000);
+            return;
+        }
         auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(self->GetAudioCodec());
         if (codec) {
             codec->SetInputMuted(false);
