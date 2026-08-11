@@ -28,6 +28,14 @@
 #define IR_TX_GPIO                  GPIO_NUM_3
 #define IR_RX_GPIO                  GPIO_NUM_5
 
+// ===== RGB 灯 (GL5050RGB01H-T, WS2811 协议 800Kbit/s, 单数据线 DIN) =====
+#define RGB_LED_GPIO                GPIO_NUM_7
+
+// ===== 指示灯 (普通单色 LED, GPIO 高低电平控制) =====
+#define INDICATOR_LED_GPIO          GPIO_NUM_6
+// 1 = GPIO 输出高电平时灯亮; 若电路是低电平亮, 改为 0
+#define INDICATOR_LED_ACTIVE_HIGH   0
+
 // #define RESET_NVS_BUTTON_GPIO        GPIO_NUM_12
 
 #endif // _BOARD_CONFIG_H_

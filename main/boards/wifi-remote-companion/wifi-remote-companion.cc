@@ -4,6 +4,7 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "led_strip.h"
 #include <esp_log.h>
 
 #include "device_state.h"
@@ -144,6 +145,18 @@ private:
     bool ac_protocol_configured_ = false;            // 是否已显式设置过品牌(NVS/set_protocol)
     IRLearner* ir_learner_ = nullptr;
     TaskHandle_t ir_task_ = nullptr;
+
+    // RGB 灯 (GL5050RGB01H-T, WS2811 单数据线协议, GPIO7 DIN)
+    led_strip_handle_t rgb_led_ = nullptr;
+    esp_timer_handle_t rgb_selftest_timer_ = nullptr;  // 硬件自检计时器(点亮绿色2秒)
+    bool rgb_on_ = false;            // 当前开关状态
+    uint8_t rgb_red_ = 255;          // 当前颜色 (未按亮度缩放)
+    uint8_t rgb_green_ = 255;
+    uint8_t rgb_blue_ = 255;
+    uint8_t rgb_brightness_ = 100;   // 亮度 0-100
+
+    // 指示灯 (GPIO6 普通单色 LED, 高低电平控制)
+    bool indicator_on_ = false;
 
     // 学习结束时延迟恢复麦克风: 模型对"学习完成"的总结 TTS 仍在喇叭播放时不能恢复,
     // 否则 TTS 会被回授进麦克风被 ASR 识别(自问自答)。先等 UNMUTE_DELAY_MS, 若设备
@@ -457,6 +470,148 @@ private:
             }
             app.ToggleChatState();
         });
+    }
+
+    // 颜色名 → RGB 映射 (支持中英文), 供 self.rgb.set 使用
+    static bool ParseColorName(const std::string& name, uint8_t& r, uint8_t& g, uint8_t& b) {
+        std::string n = name;
+        for (auto& c : n) {
+            if (c >= 'A' && c <= 'Z') c += 32;  // 仅转 ASCII, 中文不受影响
+        }
+        struct ColorMap { const char* name; uint8_t r, g, b; };
+        static const ColorMap kColors[] = {
+            {"红", 255, 0, 0}, {"red", 255, 0, 0},
+            {"橙", 255, 165, 0}, {"orange", 255, 165, 0},
+            {"黄", 255, 255, 0}, {"yellow", 255, 255, 0},
+            {"绿", 0, 255, 0}, {"green", 0, 255, 0},
+            {"青", 0, 255, 255}, {"cyan", 0, 255, 255},
+            {"蓝", 0, 0, 255}, {"blue", 0, 0, 255},
+            {"紫", 128, 0, 255}, {"purple", 128, 0, 255}, {"violet", 128, 0, 255},
+            {"粉", 255, 105, 180}, {"pink", 255, 105, 180},
+            {"白", 255, 255, 255}, {"white", 255, 255, 255},
+            {"暖白", 255, 200, 120}, {"warm white", 255, 200, 120},
+            {"冷白", 200, 220, 255}, {"cool white", 200, 220, 255},
+            {"天蓝", 135, 206, 235}, {"sky blue", 135, 206, 235},
+            {"深红", 139, 0, 0}, {"dark red", 139, 0, 0},
+            {"深蓝", 0, 0, 139}, {"dark blue", 0, 0, 139},
+            {"深绿", 0, 100, 0}, {"dark green", 0, 100, 0},
+            {"黄绿", 173, 255, 47}, {"yellow green", 173, 255, 47},
+            {"浅绿", 144, 238, 144}, {"light green", 144, 238, 144},
+            {"金", 255, 215, 0}, {"gold", 255, 215, 0},
+            {"棕", 139, 69, 19}, {"brown", 139, 69, 19},
+            {"灰", 128, 128, 128}, {"gray", 128, 128, 128},
+        };
+        // 1) 精确匹配
+        for (const auto& c : kColors) {
+            if (n == c.name) {
+                r = c.r; g = c.g; b = c.b;
+                return true;
+            }
+        }
+        // 2) 包含匹配: 支持"红色/深红色/天蓝色"等说法, 取匹配到的最长名称避免"深红"被"红"抢走
+        const ColorMap* best = nullptr;
+        size_t best_len = 0;
+        for (const auto& c : kColors) {
+            if (n.find(c.name) != std::string::npos) {
+                size_t len = strlen(c.name);
+                if (len > best_len) {
+                    best_len = len;
+                    best = &c;
+                }
+            }
+        }
+        if (best) {
+            r = best->r; g = best->g; b = best->b;
+            return true;
+        }
+        return false;
+    }
+
+    // 把当前颜色/亮度/开关状态真正发送到灯 (按亮度缩放, 关闭时发全零)
+    void ApplyRGB() {
+        uint32_t r = 0, g = 0, b = 0;
+        if (rgb_on_) {
+            uint32_t scale = rgb_brightness_ * 255 / 100;
+            r = (uint32_t)rgb_red_ * scale / 255;
+            g = (uint32_t)rgb_green_ * scale / 255;
+            b = (uint32_t)rgb_blue_ * scale / 255;
+        }
+        ESP_LOGI(TAG, "RGB LED send -> r=%u g=%u b=%u (on=%d)", r, g, b, (int)rgb_on_);
+        if (led_strip_set_pixel(rgb_led_, 0, r, g, b) == ESP_OK) {
+            esp_err_t err = led_strip_refresh(rgb_led_);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "RGB LED refresh 失败: %s", esp_err_to_name(err));
+            }
+        } else {
+            ESP_LOGE(TAG, "RGB LED set_pixel 失败");
+        }
+    }
+
+    void InitializeRGB() {
+        led_strip_config_t strip_config = {};
+        strip_config.strip_gpio_num = RGB_LED_GPIO;
+        strip_config.max_leds = 1;                 // 单颗灯珠
+        // 必须用 WS2812 高速时序(800Kbit/s): GL5050RGB01H-T 数据速率 800Kbit/s,
+        // 而 LED_MODEL_WS2811 在 led_strip 组件里是慢速 400Kbit/s 时序, 灯无法识别(会一直长亮)
+        strip_config.led_model = LED_MODEL_WS2812;
+        strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB;
+        strip_config.flags.invert_out = 0;
+
+        led_strip_rmt_config_t rmt_config = {};
+        rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
+        rmt_config.resolution_hz = 10 * 1000 * 1000;  // 10MHz tick, 驱动 800Kbit/s 时序
+        rmt_config.mem_block_symbols = 0;             // 使用默认 RMT 块大小
+        rmt_config.flags.with_dma = 0;
+
+        esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &rgb_led_);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "RGB LED 初始化失败: %s", esp_err_to_name(err));
+            rgb_led_ = nullptr;
+            return;
+        }
+        led_strip_clear(rgb_led_);
+
+        // 硬件自检: 点亮绿色 2 秒后熄灭。用于快速验证 GPIO7 数据链路——
+        // 启动后灯闪绿 = 数据能到达灯珠(问题在颜色顺序/后续指令);
+        // 启动后灯仍白色/不亮 = 数据根本没到灯(接线/供电/电平问题)
+        if (led_strip_set_pixel(rgb_led_, 0, 0, 255, 0) == ESP_OK) {
+            led_strip_refresh(rgb_led_);
+        }
+        esp_timer_create_args_t selftest_args = {
+            .callback = [](void* arg) {
+                auto* self = static_cast<WifiRemoteCompanion*>(arg);
+                if (self->rgb_led_) {
+                    led_strip_clear(self->rgb_led_);
+                }
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "rgb_selftest",
+            .skip_unhandled_events = true,
+        };
+        esp_timer_create(&selftest_args, &rgb_selftest_timer_);
+        esp_timer_start_once(rgb_selftest_timer_, 2 * 1000 * 1000);
+        ESP_LOGI(TAG, "RGB LED 初始化成功 (GPIO%d, WS2811), 自检点亮绿色 2 秒", RGB_LED_GPIO);
+    }
+
+    // 指示灯开关状态写入 GPIO (按 active_high 决定点亮电平)
+    void ApplyIndicator() {
+        int level = INDICATOR_LED_ACTIVE_HIGH ? (indicator_on_ ? 1 : 0) : (indicator_on_ ? 0 : 1);
+        gpio_set_level(INDICATOR_LED_GPIO, level);
+    }
+
+    void InitializeIndicator() {
+        gpio_config_t io_conf = {};
+        io_conf.pin_bit_mask = 1ULL << INDICATOR_LED_GPIO;
+        io_conf.mode = GPIO_MODE_OUTPUT;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        gpio_config(&io_conf);
+        indicator_on_ = false;
+        ApplyIndicator();
+        ESP_LOGI(TAG, "指示灯初始化成功 (GPIO%d, %s电平点亮)", INDICATOR_LED_GPIO,
+                 INDICATOR_LED_ACTIVE_HIGH ? "高" : "低");
     }
 
     void InitializeIR() {
@@ -1016,6 +1171,111 @@ private:
                 return resp;
             });
 
+        // ========== RGB 灯 ==========
+        mcp_server.AddTool("self.rgb.set",
+            "控制设备上的 RGB 灯(GL5050RGB01H-T)。参数均可选: color(颜色名, 支持: 红/red, 橙/orange, 黄/yellow, 绿/green, 青/cyan, 蓝/blue, "
+            "紫/purple, 粉/pink, 白/white, 暖白/warm white, 冷白/cool white, 天蓝/sky blue 等); "
+            "red/green/blue(0-255 自定义颜色, 需三通道同时给出, 与 color 二选一, color 优先); "
+            "brightness(0-100 亮度百分比, 未传保持当前亮度); "
+            "on(1开灯 0关灯, 未传保持当前)。"
+            "用户说'打开灯'传 on=1(未指定颜色则白色), '关灯'传 on=0, '调成红色'传 color='red'(自动开灯), '调亮/调暗'传 brightness。",
+            PropertyList({
+                Property("color", kPropertyTypeString, std::string("")),
+                Property("red", kPropertyTypeInteger, -1, -1, 255),
+                Property("green", kPropertyTypeInteger, -1, -1, 255),
+                Property("blue", kPropertyTypeInteger, -1, -1, 255),
+                Property("brightness", kPropertyTypeInteger, -1, -1, 100),
+                Property("on", kPropertyTypeInteger, -1, -1, 1)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string color = properties["color"].value<std::string>();
+                int red = properties["red"].value<int>();
+                int green = properties["green"].value<int>();
+                int blue = properties["blue"].value<int>();
+                int brightness = properties["brightness"].value<int>();
+                int on = properties["on"].value<int>();
+
+                ESP_LOGI(TAG, "self.rgb.set => color='%s' red=%d green=%d blue=%d brightness=%d on=%d",
+                         color.c_str(), red, green, blue, brightness, on);
+
+                bool anything = false;
+                if (!color.empty()) {
+                    uint8_t r, g, b;
+                    if (ParseColorName(color, r, g, b)) {
+                        rgb_red_ = r; rgb_green_ = g; rgb_blue_ = b;
+                        anything = true;
+                    } else {
+                        return "{\"success\": false, \"message\": \"不支持的颜色: " + color +
+                               ", 可用: 红/橙/黄/绿/青/蓝/紫/粉/白/暖白/冷白/天蓝/深红/深蓝/深绿/黄绿/浅绿/金/棕/灰\"}";
+                    }
+                }
+                if (red >= 0 && green >= 0 && blue >= 0) {
+                    rgb_red_ = (uint8_t)red; rgb_green_ = (uint8_t)green; rgb_blue_ = (uint8_t)blue;
+                    anything = true;
+                }
+                if (brightness >= 0) {
+                    rgb_brightness_ = (uint8_t)brightness;
+                    anything = true;
+                }
+                if (on >= 0) {
+                    rgb_on_ = (on == 1);
+                    anything = true;
+                }
+                if (!anything) {
+                    return "{\"success\": false, \"message\": \"未指定任何操作, 请提供 color 或 red+green+blue 或 brightness 或 on\"}";
+                }
+                // 指定颜色时自动开灯; 仅调亮度/开关时保持原状态
+                if (!color.empty() || (red >= 0 && green >= 0 && blue >= 0)) {
+                    rgb_on_ = true;
+                }
+                ApplyRGB();
+                char resp[160];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"RGB灯已设置: %s, R=%d G=%d B=%d, 亮度=%d%%\"}",
+                         rgb_on_ ? "开" : "关", rgb_red_, rgb_green_, rgb_blue_, rgb_brightness_);
+                return std::string(resp);
+            });
+
+        mcp_server.AddTool("self.rgb.get",
+            "查询 RGB 灯当前状态。返回: on(true/false), red/green/blue(当前颜色 0-255), brightness(亮度 0-100)。"
+            "用户问'灯是什么状态/什么颜色/亮不亮'时调用本工具后如实回答。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                char resp[160];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"on\": %s, \"red\": %d, \"green\": %d, \"blue\": %d, \"brightness\": %d}",
+                         rgb_on_ ? "true" : "false", rgb_red_, rgb_green_, rgb_blue_, rgb_brightness_);
+                return std::string(resp);
+            });
+
+        // ========== 指示灯 (GPIO6 单色 LED) ==========
+        mcp_server.AddTool("self.indicator.set",
+            "控制设备上的指示灯(单色 LED)。参数: on(1=点亮, 0=熄灭)。"
+            "用户说'打开指示灯/点亮指示灯'传 on=1, '关闭指示灯/熄灭指示灯'传 on=0。"
+            "注意: 指示灯与 RGB 灯(自述 rgb)是两个独立的灯, 本工具只控制指示灯。",
+            PropertyList({
+                Property("on", kPropertyTypeInteger, -1, -1, 1)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int on = properties["on"].value<int>();
+                if (on < 0) {
+                    return "{\"success\": false, \"message\": \"未指定 on 参数(1=点亮, 0=熄灭)\"}";
+                }
+                indicator_on_ = (on == 1);
+                ApplyIndicator();
+                char resp[96];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"指示灯已%s\", \"on\": %s}",
+                         indicator_on_ ? "点亮" : "熄灭", indicator_on_ ? "true" : "false");
+                return std::string(resp);
+            });
+
+        mcp_server.AddTool("self.indicator.get",
+            "查询指示灯当前状态。返回: on(true/false)。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                char resp[64];
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"on\": %s}", indicator_on_ ? "true" : "false");
+                return std::string(resp);
+            });
+
         // ========== 闹钟 ==========
         mcp_server.AddTool("self.alarm.add",
             "Add an alarm clock with specified time and optional label.",
@@ -1089,6 +1349,8 @@ public:
         move_wake_button_(MOVE_WAKE_BUTTON_GPIO)
     {
         InitializeButtons();
+        InitializeRGB();
+        InitializeIndicator();
         InitializeIR();
         InitializeTools();
     }
