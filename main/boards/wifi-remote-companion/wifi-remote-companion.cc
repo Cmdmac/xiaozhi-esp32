@@ -193,12 +193,11 @@ private:
         auto state = Application::GetInstance().GetDeviceState();
         switch (self->advance_state_) {
             case NextAdvanceState::kWaitingCurrent:
-                // 捕获时模型还在播上一个回复, 等它播完(回到非 speaking)再发送"下一个":
-                // 设备 TTS 播放期间服务器可能不处理上行音频, 等播完再发 ASR 识别率更高
+                // 打断后旧 TTS 尾巴还在播, 等它播完(回到非 speaking)再等模型对"下一个"的新回复。
+                // "下一个"已在按键捕获时立即发出, 这里只负责排空旧音频
                 if (state != kDeviceStateSpeaking) {
                     self->advance_state_ = NextAdvanceState::kWaitingReply;
                     self->waiting_reply_since_us_ = esp_timer_get_time();
-                    self->SendNextOggToServer();
                 }
                 break;
             case NextAdvanceState::kWaitingReply:
@@ -526,16 +525,20 @@ private:
 
             // 解除模型 TTS 抑制: 让模型对"下一个"的回复(如"好的, 请按模式键")可以播报出来
             Application::GetInstance().SetSuppressNetworkAudio(false);
+            // 打断模型当前语音回复: 用户按键即视为打断, 通知服务器停止当前 TTS,
+            // 立即直发"下一个", 模型快速回复对下一个键的引导, 无需等旧语音播完
+            Application::GetInstance().AbortSpeaking(kAbortReasonNone);
+            // 立即发送"下一个"给服务器(ASR 识别出"下一个", 模型语音引导下一个键)
+            SendNextOggToServer();
             // 启动"模型语音驱动推进"检查: 每次按键都从捕获时刻重新计时/复位状态机。
-            // 模型 TTS 还在播放时(设备 speaking)不立即直发"下一个": 设备 TTS 播放期间服务器
-            // 可能不处理上行音频, ASR 识别率低; 等当前回复播完(kWaitingCurrent -> kWaitingReply)再发。
+            // 打断后设备可能仍在播放旧音频(设备 speaking): 先排空旧 TTS 尾巴(kWaitingCurrent),
+            // 再等模型对"下一个"的新回复(kWaitingReply -> kReplyPlaying -> 播完推进)
             capture_time_us_ = esp_timer_get_time();
             if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
                 advance_state_ = NextAdvanceState::kWaitingCurrent;
             } else {
                 advance_state_ = NextAdvanceState::kWaitingReply;
                 waiting_reply_since_us_ = esp_timer_get_time();
-                SendNextOggToServer();
             }
             if (next_timer_) {
                 esp_timer_stop(next_timer_);

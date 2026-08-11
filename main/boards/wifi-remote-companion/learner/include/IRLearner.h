@@ -267,7 +267,7 @@ public:
         startLearning();
     }
 
-    // 学习完当前键后推进到下一个键 (由板卡在播放完"下一个"提示音+模拟回授后调用)
+    // 学习完当前键后推进到下一个键 (由板卡在模型对"下一个"的回复播完后调用)
     void nextKey() {
         if (!isSessionActive_ || !waitingAfterCapture_) {
             return;
@@ -275,7 +275,17 @@ public:
         waitingAfterCapture_ = false;
         currentKeyIndex_++;
         if (currentKeyIndex_ < (int)keys_.size()) {
-            promptUser();  // 播"请按XX键", 等待用户按遥控器
+            if (keys_[currentKeyIndex_].isLearned) {
+                // 该键已提前保存(用户在等待期按过): 不再重复提示"请按XX键"。
+                // 若是最后一个键则直接完成学习; 否则进入等待, 用户按下一个键时保存并回授
+                if (currentKeyIndex_ == (int)keys_.size() - 1) {
+                    stopLearning();
+                } else {
+                    waitingAfterCapture_ = true;
+                }
+            } else {
+                promptUser();  // 播"请按XX键", 等待用户按遥控器
+            }
         } else {
             stopLearning();
         }
@@ -296,6 +306,35 @@ public:
         }
     }
 
+    // 把最近一次 decode 的 results_ 保存为指定键的学习数据
+    void saveCaptureTo(int index) {
+        if (index < 0 || index >= (int)keys_.size()) return;
+        IRRawKey& k = keys_[index];
+        k.rawData.clear();
+        for (uint16_t i = 1; i < results_.rawlen; i++) {
+            k.rawData.push_back(results_.rawbuf[i] * kRawTick);
+        }
+        k.isLearned = true;
+
+        // 尝试解码为已知协议 (优先用库函数发送, 时序更精确)
+        k.protocol = results_.decode_type;
+        k.stateLen = results_.bits / 8;
+        if (k.stateLen > 0 && k.stateLen <= sizeof(k.state)) {
+            memcpy(k.state, results_.state, k.stateLen);
+            ESP_LOGI(TAG, ">> [%s] 解码: %s (%d 字节)",
+                     k.name.c_str(),
+                     typeToString(k.protocol).c_str(),
+                     k.stateLen);
+        } else {
+            ESP_LOGI(TAG, ">> [%s] 未识别协议, 使用原始码回放",
+                     k.name.c_str());
+        }
+
+        lastStatusMsg_ = "[" + k.name + "] 已保存 (" + std::to_string((int)k.rawData.size()) + " 符号)";
+        ESP_LOGI(TAG, ">> [%s] 已保存 (%d 符号)",
+                 k.name.c_str(), (int)k.rawData.size());
+    }
+
     // 主循环 (在 Arduino loop 中调用)
     void loop() {
         // 先处理待发送的红外指令 (从主循环执行, 避免 Web 任务时序干扰)
@@ -305,13 +344,19 @@ public:
 
         // 捕获后的等待期: 不再自动推进——由板卡播放"下一个"提示音并模拟回授(上传给服务器),
         // 模型听到后播报"请按XX键", 板卡随后调用 nextKey() 推进到下一个键。
-        // 等待期间用户再按键不应被忽略: 同样回授"下一个"给服务器(板卡会重置推进计时),
-        // 让模型重新语音引导, 避免"按了没反应、模型没回复"
+        // 等待期间用户按键: 用户按的是模型正在引导的下一个键, 先推进 currentKeyIndex_ 再保存,
+        // 并回授"下一个"——学习进度与模型认知保持一致, 避免"同键重复保存/进度错位";
+        // nextKey() 推进时若该键已提前保存就不再重复提示"请按XX键"
         if (waitingAfterCapture_) {
             if (receiver_->decode(&results_)) {
                 uint16_t rawlen = results_.rawlen;
                 if (rawlen >= 5) {
-                    ESP_LOGI(TAG, "等待推进期间按键 (rawlen=%d), 重新回授'下一个'", rawlen);
+                    if (currentKeyIndex_ + 1 < (int)keys_.size()) {
+                        currentKeyIndex_++;      // 推进到用户按的这个键
+                        saveCaptureTo(currentKeyIndex_);
+                        waitingAfterCapture_ = true;  // 保持等待, 由模型回复驱动 nextKey 再推进
+                        ESP_LOGI(TAG, "等待期按键已保存为 [%s]", keys_[currentKeyIndex_].name.c_str());
+                    }
                     if (on_key_captured_) on_key_captured_();
                 }
                 receiver_->resume();  // 清除接收缓冲, 防止同一信号重复触发
@@ -340,32 +385,7 @@ public:
 
             // 保存原始数据 (rawbuf[0] 忽略, 从 rawbuf[1] 开始)
             // 每个值 * kRawTick(2) = 微秒
-            if (currentKeyIndex_ >= 0 && currentKeyIndex_ < (int)keys_.size()) {
-                IRRawKey& k = keys_[currentKeyIndex_];
-                k.rawData.clear();
-                for (uint16_t i = 1; i < rawlen; i++) {
-                    k.rawData.push_back(results_.rawbuf[i] * kRawTick);
-                }
-                k.isLearned = true;
-
-                // 尝试解码为已知协议 (优先用库函数发送, 时序更精确)
-                k.protocol = results_.decode_type;
-                k.stateLen = results_.bits / 8;
-                if (k.stateLen > 0 && k.stateLen <= sizeof(k.state)) {
-                    memcpy(k.state, results_.state, k.stateLen);
-                    ESP_LOGI(TAG, ">> [%s] 解码: %s (%d 字节)",
-                             k.name.c_str(),
-                             typeToString(k.protocol).c_str(),
-                             k.stateLen);
-                } else {
-                    ESP_LOGI(TAG, ">> [%s] 未识别协议, 使用原始码回放",
-                             k.name.c_str());
-                }
-
-                lastStatusMsg_ = "[" + k.name + "] 已保存 (" + std::to_string((int)k.rawData.size()) + " 符号)";
-                ESP_LOGI(TAG, ">> [%s] 已保存 (%d 符号)",
-                         k.name.c_str(), (int)k.rawData.size());
-            }
+            saveCaptureTo(currentKeyIndex_);
 
             receiver_->resume();
             if (currentKeyIndex_ == (int)keys_.size() - 1) {
