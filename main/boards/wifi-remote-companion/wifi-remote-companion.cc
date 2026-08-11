@@ -377,7 +377,19 @@ private:
             for (auto v : k.rawData) PutU16(buf, off, v);
             PutU16(buf, off, k.frequency);
         }
+        // NVS blob 更新是"写新删旧"的非覆盖式存储: 旧数据空间要等垃圾回收(GC)才能释放,
+        // 16KB NVS 分区在多次学习(每次学完保存一次)后旧 blob 堆积会耗尽空间。
+        // 先 erase 旧键并 commit 触发回收, 再写新数据, 保证每次保存都是干净覆盖
+        nvs_erase_key(h, IR_NVS_KEY);
+        nvs_commit(h);
         esp_err_t err = nvs_set_blob(h, IR_NVS_KEY, buf.data(), total);
+        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+            // 空间仍不足: 再做一次强制擦除+提交, 尽量回收旧数据后再写入
+            ESP_LOGW(TAG, "NVS 空间不足, 强制擦除旧数据后重试");
+            nvs_erase_key(h, IR_NVS_KEY);
+            nvs_commit(h);
+            err = nvs_set_blob(h, IR_NVS_KEY, buf.data(), total);
+        }
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
         if (err != ESP_OK) {
@@ -754,7 +766,7 @@ private:
                         state.mode = want_mode;
                         state.target_temperature = static_cast<float>(target_temp);
                         char resp[192];
-                        snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"使用本地学习码发送[%s]键\"}", play_name.c_str());
+                        snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"使用本地学习码发送%s键\"}", play_name.c_str());
                         return std::string(resp);
                     }
                     // 本地没有学习码 → 品牌已设置则用品牌, 否则提示设置品牌
@@ -865,12 +877,16 @@ private:
 
         // ========== 红外学习/回放 ==========
         mcp_server.AddTool("self.ir.learn_start",
-            "当用户说'学习空调/学习遥控器/学习按键/开始学习'时, 必须调用本工具启动学习, 否则设备不进入学习状态、用户按遥控器无效。"
+            "强制要求: 当用户说'学习空调/学习遥控器/学习按键/开始学习'时, 你必须立即调用本工具启动学习。"
+            "严禁只回复文字而不调用工具: 若不调用本工具, 设备不会进入学习状态, 用户按遥控器无效, 学习流程彻底失败。"
             "调用: self.ir.learn_start(type='air_conditioner')。设备侧不播语音提示, 引导用户逐键操作完全由你(模型)负责: "
-            "每学完一个键, 设备会发送'下一个'语音信号, 你听到'下一个'后, 必须按本工具返回的按键顺序语音引导用户按下一个键, 如'好的, 请按[模式]键'; "
+            "每学完一个键, 设备会发送'下一个'语音信号, 你听到'下一个'后, 必须按本工具返回的按键顺序语音引导用户按下一个键, 如'好的, 请按模式键'; "
             "禁止询问'下一个要按什么键', 禁止调用 self.ir.skip(除非用户明确说'跳过/不要这个键'), 不要问品牌/学哪些键。"
-            "type: air_conditioner(默认空调, 固定顺序 电源开/电源关/模式/温度+/温度-)。注意: 空调电源键是分离码, "
-            "学习[电源开]键前必须提醒用户先确认空调处于关机状态再按电源键; 学习[电源关]键前必须提醒用户先确认空调处于开机状态再按电源键; "
+            "type: air_conditioner(默认空调, 固定顺序 电源开/电源关/模式/温度+/温度-, 共5个键)。重要计数规则: 设备每学完一个键发送一次'下一个', "
+            "按顺序: 第1次'下一个'后引导电源关键, 第2次后引导模式键, 第3次后引导温度+键, 第4次后引导温度-键, 第5次(最后一次)'下一个'才表示全部学完。"
+            "引导温度-键(第4次'下一个'后)时严禁说'学完/结束', 因为还有最后一个键; 只有听到第5次'下一个'才能宣布学习完成。"
+            "注意: 空调电源键是分离码, "
+            "学习电源开键前必须提醒用户先确认空调处于关机状态再按电源键; 学习电源关键前必须提醒用户先确认空调处于开机状态再按电源键; "
             "tv(电视); custom(自定义, keys 传逗号分隔按键列表)",
             PropertyList({
                 Property("type", kPropertyTypeString, std::string("air_conditioner")),
@@ -884,7 +900,7 @@ private:
                 EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
                 if (type == "tv") {
                     ir_learner_->learnTV();  // 固定顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单
-                    return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单。请用户先按[电源]键\"}";
+                    return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单。请用户先按电源键\"}";
                 }
                 if (type == "custom") {
                     // 解析 keys (兼容中英文逗号与空格)
@@ -916,11 +932,11 @@ private:
                     }
                     ir_learner_->startLearning();
                     std::string first_key = ir_learner_->getKeys().front().name;
-                    return "{\"success\": true, \"message\": \"好的, 学习顺序: " + keylist + "。请用户先按[" + first_key + "]键\"}";
+                    return "{\"success\": true, \"message\": \"好的, 学习顺序: " + keylist + "。请用户先按" + first_key + "键\"}";
                 }
                 // 默认: 空调
                 ir_learner_->learnAirConditioner();  // 固定顺序: 电源开/电源关/模式/温度+/温度-
-                return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源开/电源关/模式/温度+/温度-。请先确认空调已关机, 然后让用户按[电源开]键\"}";
+                return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源开/电源关/模式/温度+/温度-。请先确认空调已关机, 然后让用户按电源开键\"}";
             });
 
         mcp_server.AddTool("self.ir.learn_status",
@@ -961,7 +977,7 @@ private:
                 ir_learner_->playKey(index);
                 EnsureIRLoopTask();  // 回放需要 ir_loop 任务执行实际发送
                 char resp[256];
-                snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"playing [%s]\", \"index\": %d}",
+                snprintf(resp, sizeof(resp), "{\"success\": true, \"message\": \"playing %s\", \"index\": %d}",
                          keys[index].name.c_str(), index);
                 return std::string(resp);
             });

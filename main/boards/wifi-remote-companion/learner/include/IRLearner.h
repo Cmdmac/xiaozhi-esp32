@@ -302,7 +302,7 @@ public:
             ESP_LOGI(TAG, ">> 跳过按键 [%s]",
                      keys_[currentKeyIndex_].name.c_str());
             // 清空可能已捕获的噪声, 避免下一个按键误触发
-            if (receiver_) receiver_->resume();
+            if (receiver_) if (irEnabled_) receiver_->resume();
             waitingAfterCapture_ = false;  // 如果正在等待, 取消等待
             currentKeyIndex_++;
             promptUser();
@@ -362,7 +362,7 @@ public:
                     }
                     if (on_key_captured_) on_key_captured_();
                 }
-                receiver_->resume();  // 清除接收缓冲, 防止同一信号重复触发
+                if (irEnabled_) receiver_->resume();  // 清除接收缓冲, 防止同一信号重复触发
             }
             return;
         }
@@ -375,7 +375,7 @@ public:
 
             if (rawlen < 5) {
                 ESP_LOGW(TAG, "忽略干扰 (rawlen=%d)...", rawlen);
-                receiver_->resume();
+                if (irEnabled_) receiver_->resume();
                 return;
             }
 
@@ -390,7 +390,7 @@ public:
             // 每个值 * kRawTick(2) = 微秒
             saveCaptureTo(currentKeyIndex_);
 
-            receiver_->resume();
+            if (irEnabled_) receiver_->resume();
             if (currentKeyIndex_ == (int)keys_.size() - 1) {
                 // 最后一个键已学完 → 直接完成学习 (播放"学习完成"提示音)
                 stopLearning();
