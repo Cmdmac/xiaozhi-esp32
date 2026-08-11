@@ -239,10 +239,13 @@ public:
         promptUser();
     }
 
-    // 预设: 学习空调
+    // 预设: 学习空调 (分离码空调电源键有两个码: 关机状态按=开机码, 开机状态按=关机码)
+    // 学习顺序: 电源开 → 电源关 → 模式 → 温度+ → 温度-, 由模型引导用户分别在
+    // 空调关机/开机状态下按电源键, 回放时按"打开/关闭空调"选择对应键
     void learnAirConditioner() {
         reset();
-        addTargetKey("电源");
+        addTargetKey("电源开");   // 需空调关机状态下按电源键学习
+        addTargetKey("电源关");   // 需空调开机状态下按电源键学习
         addTargetKey("模式");
         addTargetKey("温度+");
         addTargetKey("温度-");

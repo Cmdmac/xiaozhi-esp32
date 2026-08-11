@@ -552,11 +552,11 @@ private:
             Application::GetInstance().SendOggToServer(
                 reinterpret_cast<const uint8_t*>(ogg.data()), ogg.size());
         });
-        // 提示用户按某个键时播放对应按键的语音提示(学习空调时依次播报"请按电源键/模式键/温度+/温度-")。
+        // 提示用户按某个键时播放对应按键的语音提示(学习空调时依次播报"电源开/电源关/模式/温度+/温度-")。
         // 提示音为 48kHz, 与 TTS 采样率一致, 不会触发解码器反复重建
         ir_learner_->setOnPromptKey([](const std::string& key) {
             const std::string_view* snd = nullptr;
-            if (key == "电源") snd = &Lang::Sounds::OGG_IR_AC_POWER;
+            if (key == "电源" || key == "电源开" || key == "电源关") snd = &Lang::Sounds::OGG_IR_AC_POWER;
             else if (key == "模式") snd = &Lang::Sounds::OGG_IR_AC_MODE;
             else if (key == "温度+") snd = &Lang::Sounds::OGG_IR_AC_ADD_TEMP;
             else if (key == "温度-") snd = &Lang::Sounds::OGG_IR_AC_SUB_TEMP;
@@ -711,9 +711,11 @@ private:
                     // 指令 → 学习键 映射(按优先级)
                     std::vector<std::string> candidates;
                     if (mode == "off") {
-                        candidates.push_back("电源");  // 关机 → 电源键
+                        candidates.push_back("电源关");  // 关机 → 电源关(分离码)
+                        candidates.push_back("电源");    // 兼容旧版单码学习数据(toggle)
                     } else {
-                        candidates.push_back("电源");  // 开机 → 电源键
+                        candidates.push_back("电源开");  // 开机 → 电源开(分离码)
+                        candidates.push_back("电源");    // 兼容旧版单码学习数据(toggle)
                         if (state.mode != heatpump_ir_tx::ClimateMode::OFF &&
                             state.mode != want_mode) {
                             candidates.push_back("模式");  // 切换模式 → 模式键
@@ -826,9 +828,9 @@ private:
                             if (learned_count > 0) learned_keys += ",";
                             learned_keys += k.name;
                             learned_count++;
-                            // 本地学过空调相关键(电源/模式/温度±) → 控制来源为学习码
-                            if (k.name == "电源" || k.name == "模式" ||
-                                k.name == "温度+" || k.name == "温度-") {
+                            // 本地学过空调相关键(电源开/关/模式/温度±) → 控制来源为学习码
+                            if (k.name == "电源" || k.name == "电源开" || k.name == "电源关" ||
+                                k.name == "模式" || k.name == "温度+" || k.name == "温度-") {
                                 source = "learned";
                             }
                         }
@@ -859,7 +861,9 @@ private:
             "调用: self.ir.learn_start(type='air_conditioner')。设备侧不播语音提示, 引导用户逐键操作完全由你(模型)负责: "
             "每学完一个键, 设备会发送'下一个'语音信号, 你听到'下一个'后, 必须按本工具返回的按键顺序语音引导用户按下一个键, 如'好的, 请按[模式]键'; "
             "禁止询问'下一个要按什么键', 禁止调用 self.ir.skip(除非用户明确说'跳过/不要这个键'), 不要问品牌/学哪些键。"
-            "type: air_conditioner(默认空调, 固定顺序 电源/模式/温度+/温度-); tv(电视); custom(自定义, keys 传逗号分隔按键列表)",
+            "type: air_conditioner(默认空调, 固定顺序 电源开/电源关/模式/温度+/温度-)。注意: 空调电源键是分离码, "
+            "学习[电源开]键前必须提醒用户先确认空调处于关机状态再按电源键; 学习[电源关]键前必须提醒用户先确认空调处于开机状态再按电源键; "
+            "tv(电视); custom(自定义, keys 传逗号分隔按键列表)",
             PropertyList({
                 Property("type", kPropertyTypeString, std::string("air_conditioner")),
                 Property("keys", kPropertyTypeString, std::string(""))
@@ -907,8 +911,8 @@ private:
                     return "{\"success\": true, \"message\": \"好的, 学习顺序: " + keylist + "。请用户先按[" + first_key + "]键\"}";
                 }
                 // 默认: 空调
-                ir_learner_->learnAirConditioner();  // 固定顺序: 电源/模式/温度+/温度-
-                return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源/模式/温度+/温度-。请用户先按[电源]键\"}";
+                ir_learner_->learnAirConditioner();  // 固定顺序: 电源开/电源关/模式/温度+/温度-
+                return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源开/电源关/模式/温度+/温度-。请先确认空调已关机, 然后让用户按[电源开]键\"}";
             });
 
         mcp_server.AddTool("self.ir.learn_status",
@@ -935,7 +939,8 @@ private:
             });
 
         mcp_server.AddTool("self.ir.play",
-            "回放已学习的按键。index 为按键序号, 可通过 self.ir.keys 查询",
+            "回放已学习的按键。index 为按键序号, 可通过 self.ir.keys 查询。空调学习顺序: 0=电源开, 1=电源关, 2=模式, 3=温度+, 4=温度-。"
+            "用户说'打开空调/开机'时回放 index=0(电源开); 说'关闭空调/关机'时回放 index=1(电源关); '调高温度'回放 index=3; '调低温度'回放 index=4",
             PropertyList({
                 Property("index", kPropertyTypeInteger, 0, 0, 100)
             }),
