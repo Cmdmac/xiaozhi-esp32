@@ -157,6 +157,26 @@ public:
     IRLearner(gpio_num_t rx_pin, gpio_num_t tx_pin)
         : rx_pin_(rx_pin), tx_pin_(tx_pin) {}
 
+    // 取消学习(超时自动退出等): 停止接收器并恢复状态, 但**不触发**学习完成/按键提示回调,
+    // 也不通知模型"下一个"——超时退出不是正常学完, 不应让模型宣布学习完成
+    void cancelLearning() {
+        if (!isSessionActive_) return;
+        isSessionActive_ = false;
+        currentKeyIndex_ = -1;
+        waitingAfterCapture_ = false;
+        if (receiver_ && irEnabled_) {
+            receiver_->disableIRIn();
+            irEnabled_ = false;
+        }
+        lastStatusMsg_ = "学习已取消";
+        ESP_LOGI(TAG, "===========================");
+        ESP_LOGI(TAG, "  学习已取消(超时无按键)");
+        ESP_LOGI(TAG, "===========================");
+        if (on_learning_state_changed_) {
+            on_learning_state_changed_(false);  // 恢复麦克风
+        }
+    }
+
     ~IRLearner() {
         if (receiver_) {
             if (irEnabled_) receiver_->disableIRIn();

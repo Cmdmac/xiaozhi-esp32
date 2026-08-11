@@ -89,7 +89,7 @@ public:
 
     void SetInputMuted(bool muted) {
         input_muted_ = muted;
-        ESP_LOGI(TAG, "SetInputMuted %d (学习期间麦克风%s采集)", muted, muted ? "静音, 防喇叭回授" : "恢复");
+        ESP_LOGI(TAG, "SetInputMuted %d (麦克风%s采集)", muted, muted ? "静音, 防回授" : "恢复");
     }
 
     // 注入模拟回授: pcm 为本地提示音 ogg 解码出的 48kHz int16 数据, frames 为样本数。
@@ -158,11 +158,12 @@ private:
     // 指示灯 (GPIO6 普通单色 LED, 高低电平控制)
     bool indicator_on_ = false;
 
-    // 学习结束时延迟恢复麦克风: 模型对"学习完成"的总结 TTS 仍在喇叭播放时不能恢复,
-    // 否则 TTS 会被回授进麦克风被 ASR 识别(自问自答)。先等 UNMUTE_DELAY_MS, 若设备
-    // 仍处于 speaking(模型 TTS 还没播完)则继续等待, 直到 TTS 播完才真正恢复麦克风。
+    // 窗口静音: 仅在按键捕获瞬间短暂静音麦克风(防 popup 反馈音与打断的 TTS 尾巴回授进麦克风),
+    // 约 WINDOW_MUTE_MS 后恢复。学习期间其余时间麦克风保持开启, 用户学习时也能正常说话。
+    // 说明: 设备处于 speaking(模型 TTS 播放)时 AudioService 会禁能麦克风采集, 不存在回授路径;
+    // 静音只需覆盖"打断后转 listening 的瞬间 + popup 播放窗口"即可
     esp_timer_handle_t unmute_timer_ = nullptr;
-    static constexpr uint32_t UNMUTE_DELAY_MS = 2500;  // 首轮等待时间, 之后按 speaking 状态续等
+    static constexpr uint32_t WINDOW_MUTE_MS = 1000;
 
     // 捕获按键后由模型语音驱动推进到下一个键: 不再用固定倒计时盲推,
     // 而是检测模型对"下一个"的语音回复(TTS)播完(speaking -> 非 speaking)后再 nextKey()。
@@ -176,6 +177,12 @@ private:
     static constexpr uint32_t MODEL_CHECK_MS = 300;            // 状态轮询间隔
     static constexpr uint32_t MODEL_REPLY_TIMEOUT_MS = 10000;  // 模型始终没回复时的兜底超时
     static constexpr uint32_t MODEL_RETRY_MS = 3000;           // 模型迟迟没回复时重发"下一个"
+
+    // 学习会话超时自动退出: 学习期间麦克风静音(防回授), 用户无法语音交互,
+    // 若误触发学习或遥控器不在手边, 会一直卡在学习状态; 90 秒无按键捕获自动退出学习并恢复麦克风
+    int64_t learn_started_us_ = 0;        // 本次学习开始时刻
+    int64_t learn_last_activity_us_ = 0;  // 最近一次按键捕获时刻
+    static constexpr uint64_t LEARN_TIMEOUT_MS = 90 * 1000;
 
     // 学习结束后延迟保存到 NVS 的倒计时 (ir_loop 每 20ms 递减):
     // "学习完成"提示音(约1.7s)刚投递播放, NVS flash 写入会阻塞单核 CPU,
@@ -195,13 +202,9 @@ private:
 
     static void UnmuteTimerCallback(void* arg) {
         auto* self = static_cast<WifiRemoteCompanion*>(arg);
-        // 模型对"学习完成"的总结 TTS 可能长于 UNMUTE_DELAY_MS: 若此刻仍在播放, 恢复麦克风
-        // 会把喇叭声音回授进麦克风被 ASR 识别(自问自答/乱码), 故继续等待 TTS 播完(speaking
-        // 结束)再恢复麦克风, 保证学习结束后用户随时说话都能被听到
-        if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
-            esp_timer_start_once(self->unmute_timer_, self->UNMUTE_DELAY_MS * 1000);
-            return;
-        }
+        // 窗口静音到期: 直接恢复麦克风。此时 popup 与打断的 TTS 尾巴已播完,
+        // 即使设备正在 speaking(模型回复"下一个"的 TTS), AudioService 也会禁能麦克风采集,
+        // 不存在回授路径, 无需再等待
         auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(self->GetAudioCodec());
         if (codec) {
             codec->SetInputMuted(false);
@@ -263,6 +266,22 @@ private:
             // 此刻"学习完成"提示音(约1.7s)刚被投递播放, NVS flash 写入会阻塞单核 CPU,
             // 与播放重叠会听到卡顿, 故等提示音播完再写入
             bool learning = self->ir_learner_ ? self->ir_learner_->isLearning() : false;
+
+            // 学习会话超时自动退出: 学习期间麦克风静音, 用户无法语音取消;
+            // 90 秒无按键捕获(误触发/遥控器不在手边/模型不推进) → 结束学习恢复麦克风, 避免卡死
+            if (learning) {
+                if (esp_timer_get_time() - self->learn_last_activity_us_ > (int64_t)LEARN_TIMEOUT_MS * 1000) {
+                    ESP_LOGW(TAG, "学习超时(%llu 秒无按键), 自动退出学习", (unsigned long long)(LEARN_TIMEOUT_MS / 1000));
+                    self->ir_learner_->cancelLearning();
+                    // 复位"模型语音驱动推进"状态, 停止定时器
+                    self->advance_state_ = NextAdvanceState::kWaitingCurrent;
+                    if (self->next_timer_) {
+                        esp_timer_stop(self->next_timer_);
+                    }
+                    Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
+                }
+            }
+
             if (was_learning && !learning) {
                 self->save_delay_ticks_ = self->SAVE_DELAY_TICKS;
             }
@@ -295,6 +314,14 @@ private:
         } else {
             vTaskResume(ir_task_);
         }
+    }
+
+    // 学习会话开始前的统一准备: 记录超时计时起点, 复位推进状态, 取消待执行的延迟保存
+    void BeginLearningSession() {
+        learn_started_us_ = esp_timer_get_time();
+        learn_last_activity_us_ = learn_started_us_;
+        advance_state_ = NextAdvanceState::kWaitingCurrent;
+        save_delay_ticks_ = 0;  // 若上一会话刚结束还挂着延迟保存, 立即取消
     }
 
     // ===== 空调品牌协议持久化 =====
@@ -651,6 +678,17 @@ private:
         // 本地播放 popup 短音效作为按键反馈(确认用户按键已被捕获), 不播放"下一个"人声,
         // 引导用户按哪个键仍由模型语音负责, 不播放 ic_ac 那类"请按XX键"提示音
         ir_learner_->setOnKeyCaptured([this]() {
+            // 窗口静音: 按键捕获瞬间立即静音麦克风, 防 popup 反馈音与打断的 TTS 尾巴回授进
+            // 麦克风被 ASR 识别(自问自答); 约 1 秒后由 UnmuteTimerCallback 恢复, 学习期间其余
+            // 时间麦克风保持开启, 用户学习时也能正常说话
+            auto* codec = dynamic_cast<LearningAdcPdmAudioCodec*>(GetAudioCodec());
+            if (codec) {
+                codec->SetInputMuted(true);
+            }
+            if (unmute_timer_) {
+                esp_timer_stop(unmute_timer_);
+                esp_timer_start_once(unmute_timer_, WINDOW_MUTE_MS * 1000);
+            }
             // 本地播放 popup 短音效作为按键反馈提示音(立即响应, 确认按键已被捕获)
             Application::GetInstance().PlaySound(Lang::Sounds::OGG_POPUP);
 
@@ -709,6 +747,7 @@ private:
             // 打断后设备可能仍在播放旧音频(设备 speaking): 先排空旧 TTS 尾巴(kWaitingCurrent),
             // 再等模型对"下一个"的新回复(kWaitingReply -> kReplyPlaying -> 播完推进)
             capture_time_us_ = esp_timer_get_time();
+            learn_last_activity_us_ = capture_time_us_;  // 更新学习超时计时(有按键=有活动)
             if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
                 advance_state_ = NextAdvanceState::kWaitingCurrent;
             } else {
@@ -768,12 +807,9 @@ private:
             if (!codec) {
                 return;
             }
-            // 学习期间不再抑制模型 TTS: 用户引导完全由模型语音承担
-            // (learn_start 回复"请按XX键"、对"下一个"的回复都需要播报), 本地不再播放提示音,
-            // 不存在与本地提示音重叠的问题, 故保持默认(不抑制)
-            // Application::GetInstance().SetSuppressNetworkAudio(learning);
+            // 窗口静音方案: 学习开始不再整体静音麦克风, 学习期间用户可正常说话;
+            // 仅在按键捕获时短暂静音(见 onKeyCaptured)。仍取消挂起的定时器并复位推进状态
             if (learning) {
-                // 新学习会话开始: 立即静音, 并取消可能挂起的恢复/推进定时器
                 if (unmute_timer_) {
                     esp_timer_stop(unmute_timer_);
                 }
@@ -781,11 +817,11 @@ private:
                     esp_timer_stop(next_timer_);
                 }
                 advance_state_ = NextAdvanceState::kWaitingCurrent;
-                codec->SetInputMuted(true);
             } else {
-                // 学习结束: 延迟恢复麦克风, 等完成提示音播放完毕再解除静音
-                if (unmute_timer_) {
-                    esp_timer_start_once(unmute_timer_, UNMUTE_DELAY_MS * 1000);
+                // 学习结束: 若按键捕获的窗口静音定时器仍在运行(最后键后 1 秒内), 让它自然恢复;
+                // 否则(超时取消等无静音场景)立即恢复麦克风
+                if (unmute_timer_ && !esp_timer_is_active(unmute_timer_)) {
+                    codec->SetInputMuted(false);
                 }
             }
         });
@@ -1053,6 +1089,7 @@ private:
                 }
                 std::string type = properties["type"].value<std::string>();
                 EnsureIRLoopTask();  // 学习需要 ir_loop 任务驱动捕获
+                BeginLearningSession();  // 记录学习超时计时起点, 复位推进状态
                 if (type == "tv") {
                     ir_learner_->learnTV();  // 固定顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单
                     return "{\"success\": true, \"message\": \"好的, 学习顺序: 电源/信号源/音量+/音量-/频道+/频道-/静音/菜单。请用户先按电源键\"}";
