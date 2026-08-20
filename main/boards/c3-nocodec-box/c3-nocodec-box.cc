@@ -223,6 +223,9 @@ public:
         InitializeIot();
         InitializeSpi();
         InitializeLcdDisplay();
+        if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
+            GetBacklight()->RestoreBrightness();
+        }
         InitializeTools();
     }
 
